@@ -17,7 +17,7 @@ fn main() {
     let manifest = output.join("quiet-battery.manifest");
     fs::write(&manifest, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="0.1.0.0" processorArchitecture="*" name="QuietBattery" type="win32"/>
+  <assemblyIdentity version="0.1.1.0" processorArchitecture="*" name="QuietBattery" type="win32"/>
   <description>Quiet Battery native battery tray</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
     <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
@@ -37,8 +37,8 @@ fn main() {
 101 ICON "{icon}"
 1 24 "{manifest_path}"
 1 VERSIONINFO
-FILEVERSION 0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION 0,1,1,0
+PRODUCTVERSION 0,1,1,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -50,12 +50,12 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "FileDescription", "Quiet Battery - native peripheral battery monitor\0"
-      VALUE "FileVersion", "0.1.0\0"
+      VALUE "FileVersion", "0.1.1\0"
       VALUE "InternalName", "quiet-battery\0"
       VALUE "OriginalFilename", "quiet-battery.exe\0"
       VALUE "ProductName", "Quiet Battery\0"
       VALUE "LegalCopyright", "Copyright (c) 2026 TheWebDog\0"
-      VALUE "ProductVersion", "0.1.0\0"
+      VALUE "ProductVersion", "0.1.1\0"
     END
   END
   BLOCK "VarFileInfo"

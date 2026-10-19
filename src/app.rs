@@ -1132,14 +1132,25 @@ impl App {
         }
         unsafe {
             let dpi = GetDpiForWindow(self.panel).max(96) as i32;
-            MoveWindow(
-                hwnd,
-                x * dpi / 96,
-                y * dpi / 96,
-                w * dpi / 96,
-                h * dpi / 96,
-                1,
-            );
+            let mut top = y * dpi / 96;
+            let mut height = h * dpi / 96;
+            if GetDlgCtrlID(hwnd) == THRESHOLD as i32 {
+                // Single-line EDIT has no vertical alignment style. Center its
+                // font-sized client area inside the independently drawn frame.
+                let dc = GetDC(hwnd);
+                if !dc.is_null() {
+                    let old = SelectObject(dc, self.panel_fonts[font]);
+                    let mut metrics: TEXTMETRICW = std::mem::zeroed();
+                    if GetTextMetricsW(dc, &mut metrics) != 0 {
+                        let text_height = metrics.tmHeight.clamp(1, height);
+                        top += (height - text_height) / 2;
+                        height = text_height;
+                    }
+                    SelectObject(dc, old);
+                    ReleaseDC(hwnd, dc);
+                }
+            }
+            MoveWindow(hwnd, x * dpi / 96, top, w * dpi / 96, height, 1);
             SendMessageW(hwnd, WM_SETFONT, self.panel_fonts[font] as usize, 1);
         }
     }
@@ -2823,6 +2834,32 @@ unsafe extern "system" fn panel_proc(
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     let event = match message {
+        WM_LBUTTONDOWN => {
+            let (page, scroll) = {
+                let view = bridge.view.borrow();
+                (view.page, view.scroll)
+            };
+            let dpi = unsafe { GetDpiForWindow(hwnd).max(96) as i32 };
+            let x = (lparam as i16) as i32;
+            let y = ((lparam >> 16) as i16) as i32;
+            if page == Page::Settings
+                && x >= 464 * dpi / 96
+                && x < 520 * dpi / 96
+                && y >= (168 - scroll) * dpi / 96
+                && y < (200 - scroll) * dpi / 96
+            {
+                // Keep the original full-height click target around the
+                // shorter text field; never focus a disabled threshold.
+                unsafe {
+                    let edit = GetDlgItem(hwnd, THRESHOLD as i32);
+                    if IsWindowEnabled(edit) != 0 {
+                        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(edit);
+                    }
+                }
+                return 0;
+            }
+            return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+        }
         WM_COMMAND if (wparam >> 16) as u32 == BN_CLICKED => match (wparam & 0xffff) as u32 {
             ADD => UiEvent::Control(ADD as usize),
             SETTINGS => UiEvent::Settings,
@@ -4290,6 +4327,28 @@ mod tests {
                 560 * GetDpiForWindow(window).max(96) as i32 / 96
             );
             app.switch_page(Page::Settings);
+            let threshold = GetDlgItem(window, THRESHOLD as i32);
+            let suffix = GetDlgItem(window, 114);
+            let mut edit_rect: RECT = std::mem::zeroed();
+            let mut suffix_rect: RECT = std::mem::zeroed();
+            let mut format: RECT = std::mem::zeroed();
+            GetWindowRect(threshold, &mut edit_rect);
+            GetWindowRect(suffix, &mut suffix_rect);
+            SendMessageW(threshold, EM_GETRECT, 0, &mut format as *mut RECT as isize);
+            let dc = GetDC(threshold);
+            let old_font = SelectObject(dc, SendMessageW(threshold, WM_GETFONT, 0, 0) as HFONT);
+            let mut metrics: TEXTMETRICW = std::mem::zeroed();
+            assert_ne!(GetTextMetricsW(dc, &mut metrics), 0);
+            SelectObject(dc, old_font);
+            ReleaseDC(threshold, dc);
+            let text_center = 2 * (edit_rect.top + format.top) + metrics.tmHeight;
+            let row_center = suffix_rect.top + suffix_rect.bottom;
+            assert!(
+                (text_center - row_center).abs() <= 2,
+                "threshold text must align vertically with its percent suffix"
+            );
+            assert!(edit_rect.top >= suffix_rect.top);
+            assert!(edit_rect.bottom <= suffix_rect.bottom);
             hidden_native_bitmap(window, "settings-fixture");
             assert_eq!(app.panel, window);
             assert_eq!(app.rows.len(), 1);
