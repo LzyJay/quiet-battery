@@ -2357,23 +2357,27 @@ fn panel_colors() -> PanelColors {
 // Keep native BUTTON behavior, keyboard routing and accessibility semantics;
 // only its pixels change. Each child owns its original procedure until destroy.
 struct StyledControl {
-    original: WNDPROC,
+    original: Cell<WNDPROC>,
     checkbox: bool,
-    hovered: bool,
+    hovered: Cell<bool>,
+    redraw_enabled: Cell<bool>,
+    native_redraw_suppressed: Cell<bool>,
     #[cfg(test)]
-    invalidations: u32,
+    invalidations: Cell<u32>,
 }
 unsafe fn style_control(hwnd: HWND, checkbox: bool) {
     unsafe {
         SetWindowTheme(hwnd, wide("").as_ptr(), wide("").as_ptr());
-        let state = Box::new(StyledControl {
-            original: None,
+        let state = Rc::new(StyledControl {
+            original: Cell::new(None),
             checkbox,
-            hovered: false,
+            hovered: Cell::new(false),
+            redraw_enabled: Cell::new(true),
+            native_redraw_suppressed: Cell::new(false),
             #[cfg(test)]
-            invalidations: 0,
+            invalidations: Cell::new(0),
         });
-        let pointer = Box::into_raw(state);
+        let pointer = Rc::into_raw(state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, pointer as isize);
         let original = SetWindowLongPtrW(
             hwnd,
@@ -2382,10 +2386,12 @@ unsafe fn style_control(hwnd: HWND, checkbox: bool) {
         );
         if original == 0 {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            drop(Box::from_raw(pointer));
+            drop(Rc::from_raw(pointer));
             return;
         }
-        (*pointer).original = std::mem::transmute::<isize, WNDPROC>(original);
+        (*pointer)
+            .original
+            .set(std::mem::transmute::<isize, WNDPROC>(original));
     }
 }
 unsafe extern "system" fn styled_control_proc(
@@ -2395,20 +2401,27 @@ unsafe extern "system" fn styled_control_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     unsafe {
-        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut StyledControl;
+        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const StyledControl;
         if pointer.is_null() {
             return DefWindowProcW(hwnd, message, wparam, lparam);
         }
-        let original = (*pointer).original;
-        let checkbox = (*pointer).checkbox;
+        // Native BUTTON dispatch can synchronously destroy this HWND. Retain
+        // its state through callbacks, also preventing allocation-address reuse
+        // from making a replacement control appear to be this same instance.
+        Rc::increment_strong_count(pointer);
+        let state = Rc::from_raw(pointer);
+        let original = state.original.get();
+        let checkbox = state.checkbox;
         if message == WM_NCDESTROY {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Rc::from_raw(pointer)); // Release the window's own reference.
             let result = CallWindowProcW(original, hwnd, message, wparam, lparam);
-            drop(Box::from_raw(pointer));
             return result;
         }
         if message == WM_PAINT {
-            paint_control(hwnd, checkbox);
+            if state.redraw_enabled.get() && !state.native_redraw_suppressed.get() {
+                paint_control(hwnd, checkbox);
+            }
             return 0;
         }
         // The completed custom frame paints every client pixel. A native erase
@@ -2417,15 +2430,28 @@ unsafe extern "system" fn styled_control_proc(
             return 1;
         }
         if message == WM_PRINTCLIENT {
-            if wparam != 0 {
+            if wparam != 0 && state.redraw_enabled.get() && !state.native_redraw_suppressed.get() {
                 buffer_control(hwnd, checkbox, wparam as HDC);
             }
             return 0;
         }
-        let hover_changed = (message == WM_MOUSEMOVE && !(*pointer).hovered)
-            || (message == WM_MOUSELEAVE && (*pointer).hovered);
+        if message == WM_SETREDRAW {
+            state.redraw_enabled.set(wparam != 0);
+            // A nested caller's redraw choice takes effect after our bounded
+            // suppression, without enabling native painting in its middle.
+            if state.native_redraw_suppressed.get() {
+                return 0;
+            }
+            let result = CallWindowProcW(original, hwnd, message, wparam, lparam);
+            if wparam != 0 && GetWindowLongPtrW(hwnd, GWLP_USERDATA) == pointer as isize {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            return result;
+        }
+        let hover_changed = (message == WM_MOUSEMOVE && !state.hovered.get())
+            || (message == WM_MOUSELEAVE && state.hovered.get());
         if message == WM_MOUSEMOVE && hover_changed {
-            (*pointer).hovered = true;
+            state.hovered.set(true);
             let mut tracking = windows_sys::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<
                     windows_sys::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT,
@@ -2437,18 +2463,59 @@ unsafe extern "system" fn styled_control_proc(
             windows_sys::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut tracking);
         }
         if message == WM_MOUSELEAVE && hover_changed {
-            (*pointer).hovered = false;
+            state.hovered.set(false);
+        }
+        // BUTTON can draw directly while handling these messages, bypassing
+        // WM_PAINT. Preserve native state/text/accessibility processing while
+        // leaving all resulting pixels to our buffered painter. Do not wrap
+        // mouse/key/BM_CLICK dispatch: removing WS_VISIBLE during native focus
+        // or capture handling would change input semantics.
+        let changes_frame = matches!(
+            message,
+            WM_SETTEXT
+                | WM_UPDATEUISTATE
+                | BM_SETSTATE
+                | BM_SETCHECK
+                | WM_ENABLE
+                | WM_SETFOCUS
+                | WM_KILLFOCUS
+        );
+        let suppress = changes_frame
+            && state.redraw_enabled.get()
+            && !state.native_redraw_suppressed.get()
+            && GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0;
+        if suppress {
+            state.native_redraw_suppressed.set(true);
+            CallWindowProcW(original, hwnd, WM_SETREDRAW, 0, 0);
+            if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != pointer as isize {
+                return 0;
+            }
         }
         let before = CallWindowProcW(original, hwnd, BM_GETSTATE, 0, 0);
+        if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != pointer as isize {
+            return 0;
+        }
         let result = CallWindowProcW(original, hwnd, message, wparam, lparam);
+        if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != pointer as isize {
+            return result;
+        }
+        if suppress {
+            state.native_redraw_suppressed.set(false);
+            if state.redraw_enabled.get() {
+                CallWindowProcW(original, hwnd, WM_SETREDRAW, 1, 0);
+                if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != pointer as isize {
+                    return result;
+                }
+            }
+        }
         let after = CallWindowProcW(original, hwnd, BM_GETSTATE, 0, 0);
-        if hover_changed
-            || before != after
-            || matches!(message, WM_ENABLE | WM_SETFOCUS | WM_KILLFOCUS)
-        {
+        if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != pointer as isize {
+            return result;
+        }
+        if state.redraw_enabled.get() && (hover_changed || before != after || changes_frame) {
             #[cfg(test)]
             {
-                (*pointer).invalidations += 1;
+                state.invalidations.set(state.invalidations.get() + 1);
             }
             InvalidateRect(hwnd, null(), 0);
         }
@@ -2619,7 +2686,7 @@ unsafe fn draw_control_colors(hwnd: HWND, checkbox: bool, dc: HDC, colors: &Pane
         let len = GetWindowTextW(hwnd, text.as_mut_ptr(), 512);
         let text = String::from_utf16_lossy(&text[..len as usize]);
         let control_state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const StyledControl;
-        let hovered = enabled && !control_state.is_null() && (*control_state).hovered;
+        let hovered = enabled && !control_state.is_null() && (*control_state).hovered.get();
         if checkbox {
             let checked = SendMessageW(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
             let x = if bounds.right > 100 {
@@ -3580,6 +3647,280 @@ mod tests {
         }
     }
     #[test]
+    fn styled_pushbuttons_do_not_request_native_drawing_during_label_and_state_updates() {
+        struct NativePaintTap {
+            original: WNDPROC,
+            requests: usize,
+            invalid_dc: bool,
+        }
+        unsafe extern "system" fn parent_proc(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe {
+                let tap = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativePaintTap;
+                if message == WM_CTLCOLORBTN {
+                    // A request from the original BUTTON's direct paint path,
+                    // independently of our intercepted WM_PAINT/PRINTCLIENT.
+                    (*tap).invalid_dc |= GetObjectType(wparam as HGDIOBJ) == 0;
+                    (*tap).requests += 1;
+                }
+                CallWindowProcW((*tap).original, hwnd, message, wparam, lparam)
+            }
+        }
+        unsafe {
+            let foreground = GetForegroundWindow();
+            let focused = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+            let parent = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                wide("STATIC").as_ptr(),
+                null(),
+                0,
+                0,
+                0,
+                300,
+                120,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!parent.is_null());
+            assert_eq!(IsWindowVisible(parent), 0);
+            // Establish an empty region before WS_VISIBLE is ever set: native
+            // visibility branches execute without rendering desktop pixels.
+            let region = CreateRectRgn(0, 0, 0, 0);
+            assert!(!region.is_null());
+            if SetWindowRgn(parent, region, 0) == 0 {
+                DeleteObject(region);
+                DestroyWindow(parent);
+                panic!("empty test region could not be established");
+            }
+            let mut tap = NativePaintTap {
+                original: None,
+                requests: 0,
+                invalid_dc: false,
+            };
+            SetWindowLongPtrW(parent, GWLP_USERDATA, &mut tap as *mut _ as isize);
+            struct OwnedWindow(HWND);
+            impl Drop for OwnedWindow {
+                fn drop(&mut self) {
+                    unsafe {
+                        if IsWindow(self.0) != 0 {
+                            DestroyWindow(self.0);
+                        }
+                    }
+                }
+            }
+            let owned_parent = OwnedWindow(parent);
+            let original =
+                SetWindowLongPtrW(parent, GWLP_WNDPROC, parent_proc as *const () as isize);
+            tap.original = std::mem::transmute::<isize, WNDPROC>(original);
+            let buttons = ["复制信息 A", "复制信息 B"].map(|label| {
+                let button = create_child(parent, "BUTTON", label, WS_TABSTOP, 0);
+                assert!(!button.is_null());
+                MoveWindow(button, 0, 0, 140, 36, 0);
+                style_control(button, false);
+                button
+            });
+            ShowWindow(parent, SW_SHOWNOACTIVATE);
+            // Positive control: bypass only our subclass and invoke the same
+            // native BUTTON messages. Even this empty-region window reaches
+            // native direct painting, so zero below is not a hidden-window
+            // false negative or merely a WM_PRINTCLIENT rendering assertion.
+            let messages = [
+                (WM_SETTEXT, 0, wide("原生基线")),
+                (
+                    WM_UPDATEUISTATE,
+                    UIS_CLEAR as usize | ((UISF_HIDEFOCUS as usize) << 16),
+                    Vec::new(),
+                ),
+                (BM_SETSTATE, 1, Vec::new()),
+                (BM_SETSTATE, 0, Vec::new()),
+                (
+                    WM_UPDATEUISTATE,
+                    UIS_SET as usize | ((UISF_HIDEFOCUS as usize) << 16),
+                    Vec::new(),
+                ),
+            ];
+            let mut baseline = Vec::new();
+            for button in buttons {
+                let state = GetWindowLongPtrW(button, GWLP_USERDATA) as *const StyledControl;
+                for (message, wparam, label) in &messages {
+                    let before = tap.requests;
+                    CallWindowProcW(
+                        (*state).original.get(),
+                        button,
+                        *message,
+                        *wparam,
+                        if label.is_empty() {
+                            0
+                        } else {
+                            label.as_ptr() as isize
+                        },
+                    );
+                    baseline.push((*message, tap.requests - before));
+                }
+            }
+            tap.requests = 0;
+            for button in buttons {
+                SendMessageW(button, WM_SETTEXT, 0, wide("已复制").as_ptr() as isize);
+                SendMessageW(
+                    button,
+                    WM_UPDATEUISTATE,
+                    UIS_CLEAR as usize | ((UISF_HIDEFOCUS as usize) << 16),
+                    0,
+                );
+                SendMessageW(button, BM_SETSTATE, 1, 0);
+                assert_ne!(
+                    SendMessageW(button, BM_GETSTATE, 0, 0) & BST_PUSHED as isize,
+                    0
+                );
+                SendMessageW(button, BM_SETSTATE, 0, 0);
+                assert_eq!(
+                    SendMessageW(button, BM_GETSTATE, 0, 0) & BST_PUSHED as isize,
+                    0
+                );
+                SendMessageW(
+                    button,
+                    WM_UPDATEUISTATE,
+                    UIS_SET as usize | ((UISF_HIDEFOCUS as usize) << 16),
+                    0,
+                );
+                SendMessageW(button, WM_SETFOCUS, 0, 0);
+                SendMessageW(button, WM_KILLFOCUS, 0, 0);
+                assert_eq!(window_text(button), "已复制");
+                assert_ne!(GetUpdateRect(button, null_mut(), 0), 0);
+            }
+            let native_requests = tap.requests;
+            // Hidden and caller-redraw-disabled controls must never be made
+            // visible by an internal FALSE/TRUE redraw pair.
+            ShowWindow(buttons[0], SW_HIDE);
+            SendMessageW(buttons[1], WM_SETREDRAW, 0, 0);
+            for button in buttons {
+                SendMessageW(button, WM_SETTEXT, 0, wide("状态保留").as_ptr() as isize);
+                SendMessageW(button, BM_SETSTATE, 1, 0);
+                SendMessageW(button, BM_SETSTATE, 0, 0);
+                assert_eq!(GetWindowLongPtrW(button, GWL_STYLE) as u32 & WS_VISIBLE, 0);
+            }
+            let state = GetWindowLongPtrW(buttons[1], GWLP_USERDATA) as *const StyledControl;
+            assert!(!(*state).redraw_enabled.get());
+            drop(owned_parent);
+            assert_eq!(GetForegroundWindow(), foreground);
+            assert_eq!(
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus(),
+                focused
+            );
+            eprintln!(
+                "native BUTTON per-message direct-paint requests (two buttons): {baseline:?}; styled={native_requests}; foreground/focus unchanged; empty region established before show"
+            );
+            assert!(!tap.invalid_dc);
+            assert!(
+                baseline
+                    .iter()
+                    .any(|(message, count)| *message == WM_SETTEXT && *count > 0)
+            );
+            assert!(
+                baseline
+                    .iter()
+                    .any(|(message, count)| *message == WM_UPDATEUISTATE && *count > 0)
+            );
+            assert!(
+                baseline
+                    .iter()
+                    .any(|(message, count)| *message == BM_SETSTATE && *count > 0)
+            );
+            assert_eq!(
+                native_requests, 0,
+                "styled buttons reached original BUTTON drawing during label/state updates"
+            );
+        }
+    }
+    #[test]
+    fn styled_control_nested_redraw_choice_and_synchronous_destruction_are_safe() {
+        struct Forward {
+            native: WNDPROC,
+            destroy_on: u32,
+        }
+        unsafe extern "system" fn forwarding_proc(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe {
+                let forward =
+                    GetPropW(hwnd, wide("QuietBattery.Test.Forward").as_ptr()) as *const Forward;
+                let native = (*forward).native;
+                if message == (*forward).destroy_on {
+                    DestroyWindow(hwnd);
+                    return 1;
+                }
+                if message == WM_SETTEXT {
+                    SendMessageW(hwnd, WM_SETREDRAW, 0, 0);
+                }
+                CallWindowProcW(native, hwnd, message, wparam, lparam)
+            }
+        }
+        unsafe {
+            let parent = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                0,
+                0,
+                0,
+                300,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!parent.is_null());
+            for destroy_on in [0, WM_SETTEXT, WM_SETREDRAW] {
+                let button = create_child(parent, "BUTTON", "初始", WS_TABSTOP, 0);
+                style_control(button, false);
+                let pointer = GetWindowLongPtrW(button, GWLP_USERDATA) as *const StyledControl;
+                Rc::increment_strong_count(pointer);
+                let state = Rc::from_raw(pointer);
+                let weak = Rc::downgrade(&state);
+                let forward = Forward {
+                    native: state.original.get(),
+                    destroy_on,
+                };
+                assert_ne!(
+                    SetPropW(
+                        button,
+                        wide("QuietBattery.Test.Forward").as_ptr(),
+                        &forward as *const _ as HANDLE
+                    ),
+                    0
+                );
+                state.original.set(Some(forwarding_proc));
+                drop(state);
+                SendMessageW(button, WM_SETTEXT, 0, wide("重入").as_ptr() as isize);
+                if destroy_on != 0 {
+                    assert_eq!(IsWindow(button), 0);
+                    assert!(
+                        weak.upgrade().is_none(),
+                        "destroyed control state must be released after outer dispatch"
+                    );
+                } else {
+                    let state = weak.upgrade().unwrap();
+                    assert!(!state.redraw_enabled.get());
+                    assert!(!state.native_redraw_suppressed.get());
+                    assert_eq!(GetWindowLongPtrW(button, GWL_STYLE) as u32 & WS_VISIBLE, 0);
+                    assert_eq!(window_text(button), "重入");
+                    DestroyWindow(button);
+                }
+            }
+            DestroyWindow(parent);
+        }
+    }
+    #[test]
     fn styled_control_hover_erase_and_buffered_paint_stress_releases_resources() {
         use windows_sys::Win32::System::Threading::{
             GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources,
@@ -3643,25 +3984,34 @@ mod tests {
                 DeleteObject(brush);
                 assert_eq!(SendMessageW(control, WM_ERASEBKGND, dc as usize, 0), 1);
                 assert_eq!(GetPixel(dc, 0, 0), 0x00ff00ff);
+                SendMessageW(control, WM_SETREDRAW, 0, 0);
+                SendMessageW(control, WM_PRINTCLIENT, dc as usize, 0);
+                SendMessageW(control, WM_PAINT, 0, 0);
+                assert_eq!(
+                    GetPixel(dc, 0, 0),
+                    0x00ff00ff,
+                    "explicit paint must preserve the caller's redraw-disabled choice"
+                );
+                SendMessageW(control, WM_SETREDRAW, 1, 0);
                 ValidateRect(control, null());
                 let state = GetWindowLongPtrW(control, GWLP_USERDATA) as *const StyledControl;
-                let before_hover = (*state).invalidations;
+                let before_hover = (*state).invalidations.get();
                 SendMessageW(control, WM_MOUSEMOVE, 0, 10 | (10 << 16));
-                assert_eq!((*state).invalidations, before_hover + 1);
+                assert_eq!((*state).invalidations.get(), before_hover + 1);
                 ValidateRect(control, null());
                 for x in 10..500 {
                     SendMessageW(control, WM_MOUSEMOVE, 0, x | (20 << 16));
                 }
                 assert_eq!(
-                    (*state).invalidations,
+                    (*state).invalidations.get(),
                     before_hover + 1,
                     "moving inside the same hover region must not invalidate again"
                 );
                 SendMessageW(control, WM_MOUSELEAVE, 0, 0);
-                assert_eq!((*state).invalidations, before_hover + 2);
+                assert_eq!((*state).invalidations.get(), before_hover + 2);
                 ValidateRect(control, null());
                 SendMessageW(control, WM_MOUSELEAVE, 0, 0);
-                assert_eq!((*state).invalidations, before_hover + 2);
+                assert_eq!((*state).invalidations.get(), before_hover + 2);
                 SendMessageW(control, BM_SETCHECK, 0, 0);
                 SendMessageW(control, BM_CLICK, 0, 0);
                 assert_eq!(
