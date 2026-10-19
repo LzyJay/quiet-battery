@@ -106,6 +106,19 @@ impl Manager {
             if let Some(state) = self.devices.iter_mut().find(|s| s.descriptor.id == *id) {
                 state.connected = true;
                 state.connection_known = true;
+                // A transient first discovery may create an unsupported placeholder.
+                // Its first confirmed mouse discovery gets the same default selection
+                // as a new supported mouse. Removal is the explicit monitoring opt-out;
+                // existing supported devices and their preferences keep their choices.
+                if !state.descriptor.supported
+                    && candidate.descriptor.supported
+                    && candidate.descriptor.kind == DeviceKind::Mouse
+                    && state.reading.is_none()
+                    && state.last_success.is_none()
+                    && !state.removed
+                {
+                    state.selected = true;
+                }
                 if candidate.descriptor.supported {
                     state.descriptor = candidate.descriptor;
                 }
@@ -643,8 +656,7 @@ mod tests {
                 supported,
                 provider: "fixture".into(),
             },
-            reading: Some(Reading::from_levels("Peripheral".into(), 3, 4).unwrap())
-                .filter(|_| supported),
+            reading: supported.then_some(Reading::from_levels("Peripheral".into(), 3, 4).unwrap()),
             error: None,
         }
     }
@@ -688,6 +700,50 @@ mod tests {
             75
         );
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn first_successful_mouse_after_placeholder_is_selected_but_keyboard_is_manual() {
+        for kind in [DeviceKind::Mouse, DeviceKind::Keyboard] {
+            let mut manager = Manager::default();
+            let mut unavailable = candidate("first", kind, false);
+            unavailable.descriptor.recoverable = true;
+            unavailable.error = Some(DeviceError::Unavailable("asleep on first discovery".into()));
+            manager.merge(vec![unavailable], 100);
+            assert!(!manager.devices[0].selected);
+            let mut success = candidate("first", kind, true);
+            success.reading = Some(
+                Reading::from_percent("Peripheral".into(), 9, PowerState::Discharging).unwrap(),
+            );
+            manager.merge(vec![success], 200);
+            let state = &manager.devices[0];
+            assert_eq!(state.selected, kind == DeviceKind::Mouse);
+            assert_eq!(
+                manager.visible().count(),
+                usize::from(kind == DeviceKind::Mouse)
+            );
+            assert!(state.connected && state.show_tray && state.descriptor.supported);
+            assert_eq!(state.last_success, Some(200));
+            assert_eq!(state.reading.as_ref().unwrap().normalized_percent(), 9);
+        }
+    }
+    #[test]
+    fn removed_mouse_preserves_opt_out_and_preferences_across_failure_and_recovery() {
+        let mut manager = Manager::default();
+        manager.merge(vec![candidate("removed", DeviceKind::Mouse, true)], 100);
+        manager.remove("removed");
+        manager.devices[0].show_tray = false;
+        manager.devices[0].notify = false;
+        let mut failed = candidate("removed", DeviceKind::Mouse, false);
+        failed.descriptor.recoverable = true;
+        failed.error = Some(DeviceError::Unavailable("asleep".into()));
+        manager.merge(vec![failed], 200);
+        assert_eq!(manager.devices[0].last_success, Some(100));
+        manager.merge(vec![candidate("removed", DeviceKind::Mouse, true)], 300);
+        let state = &manager.devices[0];
+        assert!(state.removed && state.connected && state.descriptor.supported);
+        assert!(!state.selected && !state.show_tray && !state.notify);
+        assert_eq!(state.last_success, Some(300));
+        assert_eq!(manager.visible().count(), 0);
     }
     #[test]
     fn full_metadata_roundtrip_and_v4_cache_migration() {
