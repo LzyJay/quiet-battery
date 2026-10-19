@@ -4,7 +4,7 @@
 
 Windows 原生外设电量托盘工具。Rust + Win32，单 EXE，后台低频读取；按设备保存电量、托盘选择和低电提醒。
 
-**[下载 Windows x64 测试版](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.1.0)** · [设备扩展](docs/ADDING_DEVICES.md) · [商业授权](COMMERCIAL.md)
+**[下载 Windows x64 测试版](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.1.1)** · [设备扩展](docs/ADDING_DEVICES.md) · [商业授权](COMMERCIAL.md)
 
 ## 使用
 
@@ -18,7 +18,13 @@ EXE 旁的 `data` 文件夹保存本地偏好和上次成功电量。移动 EXE 
 
 ## 界面
 
-以下为运行程序的实际托盘截图。
+以下为0.1.1运行程序的实际截图。
+
+![主窗口](docs/images/main.png)
+
+![设置](docs/images/settings.png)
+
+![添加设备](docs/images/add-devices.png)
 
 ![托盘](docs/images/tray.png)
 
