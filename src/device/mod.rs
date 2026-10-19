@@ -1,5 +1,6 @@
 //! Read-only protocol adapters and common, device-independent battery values.
 mod bas;
+mod diagnostics;
 mod discovery;
 mod logitech;
 use std::{
@@ -264,8 +265,16 @@ impl ProtocolAdapter for HidppAdapter {
 static ADAPTERS: &[&dyn ProtocolAdapter] = &[&HidppAdapter, &bas::BasAdapter];
 pub struct Registry;
 impl Registry {
-    pub fn diagnostic_information(id: &str) -> Option<String> {
-        discovery::diagnostic_information(id)
+    #[cfg(test)]
+    pub fn diagnostic_fixture() -> Candidate {
+        discovery::publish_diagnostic_fixture()
+    }
+    /// Independent passive HID inventory. Does not initialize/query adapters.
+    pub fn diagnose(cancel: &Cancellation, identifiers: bool) -> Result<String, DeviceError> {
+        diagnostics::inventory(cancel).map(|report| report.json(identifiers))
+    }
+    pub fn diagnostic_information(descriptor: &DeviceDescriptor) -> Option<String> {
+        discovery::diagnostic_information(&descriptor.physical_id)
     }
     pub fn runtime() -> Result<bas::Runtime, DeviceError> {
         bas::Runtime::init()

@@ -34,7 +34,40 @@ Registry 是集中入口。新增协议实现 `ProtocolAdapter` 的 `name`、`ow
 
 可用的协议变化事件通过 Registry 的 change handler 送回通用读数；只能确认状态变化而需要新百分比时，使用 refresh handler 请求串行读取。不得在回调内直接操作 GUI。BAS 已实现这条路径，运行时由查询线程创建 MTA，取消和关闭句柄后才释放。标准 2A19 没有充电字段；仅实际读取成功的标准 2BED 状态允许产生 Charging / Discharging。当前没有 BAS 真机证据，解析夹具与 Windows API 路径实现不能写成型号已测。
 
-未适配 HID 行的“复制信息”使用后台发现时缓存的 VID/PID、Usage Page / Usage、接口号及容器分组；不在 GUI 枚举设备，不收集序列号。报文长度与电量查询仍须另行确认，容器 GUID 只用于本机定位。复制内容不是完整的协议适配证据。
+HID“复制信息”只读取后台发现缓存，包括同一物理组内的输入和厂商集合、VID/PID/release、usage、接口、总线、厂商/产品字符串与 Windows 属性。按容器身份分组后才挑选输入候选；鼠标+键盘混合组保守显示 Generic，厂商专用集合不生成默认鼠标。名字和类型的选择不依赖枚举顺序，两个同 VID/PID 容器保持独立。不在 GUI 线程枚举设备；适配器已认领的设备也可在 `--scan` 获取兄弟集合缓存。
+
+### 手上只有 IDs 时怎么继续
+
+1. 先用 `tools/export-diagnostics.ps1` 导出默认匿名 `--diagnose`，查看同一 `group` 内的输入与 vendor usage 集合、字符串来源、Windows 描述/枚举器/服务、VID/PID、release、接口和长度。拒绝访问的集合仍在清单中；`null` 和失败码是未知，不是缺少电量能力。若目标根本没有 HID 接口，按 [开发说明](DEVELOPMENT.md) 用设备管理器或只读 PnP 属性找到它所属的传输层。
+2. VID/PID 定位 USB 注册厂商/产品标识，不能独自证明零售品牌；Windows manufacturer 可能描述驱动提供者，hidapi 字符串也可能来自 Windows 回退。USB 只证明报告中的总线，不能证明设备使用2.4GHz无线。结合用户确认的实物型号、接收器和连接方式，再查厂商公开协议、标准或原始实现。不要把猜测改写成已确认字段。
+3. 本机需要对照具体集合时，再显式导出 `--include-identifiers`。路径/容器可能含可识别内容，不加入公开夹具。共享容器只说明 Windows 物理分组，不是接收器里某台已配对外设的槽位身份。
+4. 对照已知协议的 report-ID、usage、所需查询和回复结构。Windows 集合长度包含 report-ID 槽位，只能帮助排除错误端点；它不提供电量字段、每包布局或原始描述符。没有查询依据就保留未支持状态；不靠遍历未知命令、写 Feature/Output、读取键鼠输入流来试错。
+5. 确认可复用协议就验证现有适配器；共用协议例外补在其模块；新协议使用下方最小流程。把每个判断标为实测、资料推断或待确认，不凭“可枚举”宣布电量支持。
+
+
+从清单提取本轮分组、端点、搜索用 VID:PID 和产品信息：
+
+```powershell
+$qbReport = Get-Content ./validation/diagnostics.json -Raw -Encoding UTF8 | ConvertFrom-Json
+$qbReport.collections | ForEach-Object {
+    $qbFields = $_.fields
+    $qbIds = if ($null -ne $qbFields.vid.value -and $null -ne $qbFields.pid.value) {
+        '{0:X4}:{1:X4}' -f [int]$qbFields.vid.value, [int]$qbFields.pid.value
+    } else { 'unavailable' }
+    [pscustomobject]@{
+        Group = $_.group; Endpoint = $_.endpoint; VID_PID = $qbIds
+        Manufacturer = $qbFields.manufacturer.value; Product = $qbFields.product.value
+    }
+} | Format-Table -AutoSize
+```
+
+JSON 的 VID/PID、usage page/usage 和长度都是十进制字符串。例如 VID `1133` 转为十六进制才是 `046D`，PID `50495` 转为 `C53F`；检索时用 `046D:C53F`，不要把原始十进制当十六进制。选定端点后检查每项的 `source` / `error`，例如 `$qbReport.collections[0].fields.product`；缺字符串时再看 `friendly_name`、`description`、`windows_manufacturer`、`bus_description`。这些字段可能描述驱动或接收器，不能直接当作零售品牌或已配对外设型号。
+
+### 最小适配与夹具流程
+
+新建 `src/device/<protocol>.rs`，实现 `ProtocolAdapter`，使用独立 ID 前缀；在 `ADAPTERS` 登记一次。发现返回 `Candidate` 与可靠的 `physical_id` / `endpoint`，读取只按选定身份返回通用 `Reading`。查询、锁和等待有界，失败与取消遵守缓存边界；无需改 Manager、UI、托盘或通知规则。
+
+先在模块测试里加入已核对来源的最小“查询→回复→字段解释”夹具。至少包含正常、极值、截断、错误、无关回复和请求身份不匹配；涉及档位或充电时分别覆盖其有效与未知情况。夹具剥离本机路径、容器和序列号。运行 `tools/build.ps1 -SkipCopy -Offline`，再按下列步骤取得真实设备证据。只有实机成功的型号/场景才进入支持表，资料与夹具不能替代真机。
 
 ## 在本机开发
 

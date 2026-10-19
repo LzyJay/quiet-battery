@@ -4,7 +4,7 @@
 
 Windows 原生外设电量托盘工具。Rust + Win32，单 EXE，后台低频读取；按设备保存电量、托盘选择和低电提醒。
 
-**[下载 Windows x64 测试版](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.1.1)** · [设备扩展](docs/ADDING_DEVICES.md) · [商业授权](COMMERCIAL.md)
+**[下载 Windows x64 稳定版](https://github.com/TheWebDog/quiet-battery/releases/latest)** · [设备扩展](docs/ADDING_DEVICES.md) · [商业授权](COMMERCIAL.md)
 
 ## 使用
 
@@ -18,7 +18,7 @@ EXE 旁的 `data` 文件夹保存本地偏好和上次成功电量。移动 EXE 
 
 ## 界面
 
-以下为0.1.1运行程序的实际截图。
+以下为0.1.1运行程序的实际截图；0.2.0沿用相同界面。
 
 ![主窗口](docs/images/main.png)
 
@@ -45,7 +45,9 @@ EXE 旁的 `data` 文件夹保存本地偏好和上次成功电量。移动 EXE 
 | 标准蓝牙 BAS：180F / 2A19 | 已实现已配对、当前连接且已有访问许可设备的标准电池读取及变化订阅；尚无 BAS 外设真机验证 |
 | 其他厂商 | 需要验证共用协议或增加独立适配器；枚举到设备不等于能读电量 |
 
-16类图标覆盖不等于16类硬件协议都已适配。未适配设备仅可复制适配信息。程序不联网、不上传设备数据。
+v0.2.0 是正常稳定发布，支持边界以上表为准。16类图标不代表16类协议已适配；BAS 和其他 HID++ 型号仍属待真机验证范围。未适配设备可复制后台缓存的集合、标识和元数据来源，用于继续适配。程序不联网、不上传设备数据。
+
+可用 `--diagnose` 导出被动 HID 集合清单：包括厂商/产品字符串、Windows 属性、来源、字段失败和报文最大长度。它不查询电量，不打开输入流；默认隐藏本机路径和容器标识。它只覆盖 HID 接口，不能代替所有 USB、PnP 或 BLE 设备清单。命令与导出方法见 [诊断说明](docs/DEVELOPMENT.md)，后续调查见 [扩展指南](docs/ADDING_DEVICES.md)。
 
 资源实测与验证边界见 [验证记录](docs/VALIDATION.md)，数值对应单台 G304 和短时托盘运行，不代表长期稳定性或所有外设的结果。
 

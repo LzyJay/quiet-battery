@@ -423,7 +423,7 @@ fn opt_number(value: Option<u64>) -> String {
 }
 pub fn descriptor_json(candidate: &Candidate) -> String {
     format!(
-        "{{\"id\":{},\"name\":{},\"kind\":{},\"supported\":{},\"provider\":{},\"reading\":{},\"error\":{}}}",
+        "{{\"id\":{},\"name\":{},\"kind\":{},\"supported\":{},\"provider\":{},\"reading\":{},\"error\":{},\"diagnostics\":{}}}",
         json_string(&candidate.descriptor.id),
         json_string(&candidate.descriptor.name),
         json_string(candidate.descriptor.kind.key()),
@@ -436,7 +436,8 @@ pub fn descriptor_json(candidate: &Candidate) -> String {
         candidate
             .error
             .as_ref()
-            .map_or_else(|| "null".into(), |e| json_string(&e.to_string()))
+            .map_or_else(|| "null".into(), |e| json_string(&e.to_string())),
+        Registry::diagnostic_information(&candidate.descriptor).unwrap_or_else(|| "null".into())
     )
 }
 impl App {
@@ -1837,7 +1838,7 @@ impl App {
                             state.descriptor.provider,
                             state.descriptor.id
                         );
-                        if let Some(details) = Registry::diagnostic_information(&device_id) {
+                        if let Some(details) = Registry::diagnostic_information(&state.descriptor) {
                             info.push_str("\r\n");
                             info.push_str(&details);
                         }
@@ -3470,6 +3471,21 @@ unsafe fn run_owned() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supported_descriptor_json_looks_up_both_cached_collections_by_physical_identity() {
+        let candidate = crate::device::Registry::diagnostic_fixture();
+        assert_ne!(candidate.descriptor.id, candidate.descriptor.physical_id);
+        let cached =
+            crate::device::Registry::diagnostic_information(&candidate.descriptor).unwrap();
+        assert_eq!(cached.matches("\"endpoint\":").count(), 2);
+        let json = super::descriptor_json(&candidate);
+        assert!(json.contains("\"id\":\"fixture-protocol:slot-7\""));
+        assert!(json.contains("\"supported\":true"));
+        assert!(json.contains("\"diagnostics\":{\"mode\":\"cached-hid-metadata\""));
+        assert!(json.contains("fixture-input"));
+        assert!(json.contains("fixture-vendor"));
+        assert_eq!(json.matches("\"endpoint\":").count(), 2);
+    }
     use super::*;
     #[test]
     fn native_focus_cues_follow_mouse_keyboard_without_moving_focus() {

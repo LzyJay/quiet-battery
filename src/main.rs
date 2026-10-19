@@ -64,6 +64,12 @@ fn main() {
             output(concat!("Quiet Battery ", env!("CARGO_PKG_VERSION")));
             Ok(())
         }
+        Some("--diagnose") => match diagnose_identifiers(std::env::args().skip(2)) {
+            Ok(identifiers) => Registry::diagnose(&device::Cancellation::default(), identifiers)
+                .map(|json| output(&json))
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        },
         Some("--scan") => Registry::discover_cancelled(&device::Cancellation::default())
             .map(|report| {
                 output(&format!(
@@ -127,7 +133,7 @@ fn main() {
         Some("--startup-status") => print_startup(),
         Some("--help" | "-h") => {
             output(
-                "Quiet Battery\n默认启动原生托盘；--scan 发现设备；--probe <id> 查询指定设备；--once 读取一次；--status 当前托盘快照；--refresh 刷新；--quit 退出；--show 打开主窗口；--hide-panel 关闭主窗口；--show-menu 打开真实托盘菜单；--startup-status / --startup-enable / --startup-disable 管理当前用户登录启动。\n隔离通知自测：--test-notification。测试钩子：--simulate-device-error / --simulate-recovery / --simulate-explorer-restart。",
+                "Quiet Battery\n默认启动原生托盘；--diagnose 被动 HID 元数据（可选 --include-identifiers 导出本机标识）；--scan 发现并查询电量；--probe <id> 查询指定设备；--once 读取一次；--status 当前托盘快照；--refresh 刷新；--quit 退出；--show 打开主窗口；--hide-panel 关闭主窗口；--show-menu 打开真实托盘菜单；--startup-status / --startup-enable / --startup-disable 管理当前用户登录启动。\n隔离通知自测：--test-notification。测试钩子：--simulate-device-error / --simulate-recovery / --simulate-explorer-restart。",
             );
             Ok(())
         }
@@ -154,4 +160,30 @@ fn print_startup() -> Result<(), String> {
         app::json_string(&state.path.to_string_lossy())
     ));
     Ok(())
+}
+
+fn diagnose_identifiers(arguments: impl Iterator<Item = String>) -> Result<bool, String> {
+    let arguments: Vec<_> = arguments.collect();
+    match arguments.as_slice() {
+        [] => Ok(false),
+        [flag] if flag == "--include-identifiers" => Ok(true),
+        _ => Err("用法: --diagnose [--include-identifiers]".into()),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_identifiers_require_explicit_opt_in() {
+        assert!(!diagnose_identifiers(Vec::<String>::new().into_iter()).unwrap());
+        assert!(diagnose_identifiers(vec!["--include-identifiers".into()].into_iter()).unwrap());
+        assert!(
+            diagnose_identifiers(vec!["--include-identifiers=true".into()].into_iter()).is_err()
+        );
+        assert!(
+            diagnose_identifiers(vec!["--include-identifiers".into(), "extra".into()].into_iter())
+                .is_err()
+        );
+    }
 }

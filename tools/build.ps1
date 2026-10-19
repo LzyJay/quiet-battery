@@ -21,6 +21,9 @@ $env:CARGO_ENCODED_RUSTFLAGS = @(
     "--remap-path-prefix=$qbRustSysroot=rust-toolchain"
 ) -join [char]31
 if ($Offline) { $env:CARGO_NET_OFFLINE = 'true' }
+# Native resource assertions observe per-process GDI counts. Concurrent tests
+# would count one another's temporary objects, so default to serial execution.
+if (-not $env:RUST_TEST_THREADS) { $env:RUST_TEST_THREADS = '1' }
 $manifestPath = Join-Path $projectRoot 'Cargo.toml'
 function Invoke-Cargo([string[]]$CargoArgs) {
     & cargo @CargoArgs
