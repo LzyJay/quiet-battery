@@ -1,0 +1,6 @@
+{
+  "ui": {"paper":"#FAF8F5","text":"#302D29","secondary":"#716B63","accent":"#A9593E"},
+  "software": {"paper":"#EEE3CF","outline":"#292824","fill":"#B65F43"},
+  "tray_light": {"outline":"#30332F","fill":"#B56743","track":"#F5F2EC"},
+  "tray_dark": {"outline":"#FFF8EA","fill":"#F1B477","track":"#262725"}
+}

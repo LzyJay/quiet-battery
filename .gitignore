@@ -1,0 +1,10 @@
+/.build/
+/target/
+/_bmad/
+/_bmad-output/
+/.archive/
+/design-proposals/
+/validation/
+/dist/
+__pycache__/
+*.log

@@ -1,0 +1,42 @@
+# 实现结构
+
+## 技术栈
+
+| 部分 | 实现与作用 |
+|---|---|
+| 主程序 | Rust 2024；错误类型、身份、缓存、提醒周期与串行工作线程 |
+| 窗口与托盘 | `windows-sys` 调Win32/GDI/Shell；原生窗口和控件语义，自绘像素；不加载网页运行时 |
+| 2.4G查询 | `hidapi` 的Windows native后端；适配器解释HID++等协议，界面不接触报文 |
+| 蓝牙 | `windows` / WinRT访问标准GATT Battery Service |
+| 自启 | 用户Startup的`.lnk`，Shell Link COM；用户禁用后不自行恢复 |
+| 图标 | 透明掩码和ICO编入EXE；Python/Pillow仅用于开发期再生成 |
+| 构建 | Cargo+MSVC+Windows SDK，静态CRT，release单EXE；许可声明也编入二进制 |
+
+## 数据路径
+
+设备发现 → `ProtocolAdapter` / `Registry` → 通用 `Reading` → `Manager` → 主窗口、托盘、提醒。
+
+- `src/device/`：发现、协议、查询、取消、设备类型与读数。`ADAPTERS`静态登记协议家族，不是设备数据库或运行时插件。
+- `src/manager.rs`：按身份独立的监控/托盘/提醒选择，成功缓存及v6本地状态；向后读取v4/v5。
+- `src/notifications.rs`：品牌无关的提醒周期与Windows提交。新有效读数推进周期，保存成功后投递；失败保留待投递项。
+- `src/app.rs`：主线程消息循环、三页控件、后台任务/结果桥、Shell菜单。同步回调也显式唤醒循环。
+- `src/icons.rs`：按类型和电量生成当前HICON，主窗口与托盘使用同源填色几何。
+- `src/startup.rs`：真实自启与快捷方式；`src/licenses.rs`：单EXE许可文本。
+
+## 状态与调度
+
+监控选择和连接状态分开。休眠/超时保留成功值与成功时间；确认断开后隐藏显示，选择和缓存仍在，重连恢复。启动尚未确认连接的缓存可先显示。只有无成功值时才用未知。
+
+有百分比就使用设备值；纯档位由适配器解释编号和范围后归一化。G304的90来自设备，固件仍按离散档位变化；UI十格不代表测量精度。
+
+读取串行、重复刷新合并、低频定时兜底；设备变化、恢复及可用协议事件请求有界刷新。UI不等待HID或GATT。MTA与WinRT会话同寿命，UI的COM引用覆盖消息循环。Native资源成对释放，控件缓冲仅存在于一次绘制。
+
+## 蓝牙边界
+
+仅访问已配对、当前连接且已有访问许可的BLE设备。读取180F中的2A19；Notify/Indicate可用则订阅，否则低频读。可选2BED按标准解释充电，缺失或失败保持未知，不猜私有字段。先取基本电量，再用余量读可选状态。发现预算8秒，主动读取预算3秒，取消与失败不会卡住UI。
+
+单设备/服务失败保留成功候选及未完整确认设备的旧值。AEP请求GUID类型的 `System.Devices.Aep.ContainerId`，与HID使用相同字节序容器键；缺失时保守回退。会话也核对Windows配对身份。属性定义见 [Microsoft文档](https://learn.microsoft.com/en-us/windows/apps/develop/devices-sensors/device-information-properties)。
+
+## 分发与隐私
+
+运行不需要Rust、Python、SDK或驱动安装。便携数据在EXE旁的 `data/`，开发目录的 `dist` 实例使用项目 `.build/`。程序没有网络或遥测路径；设备身份与错误诊断留在本机，公开仓库只放源码、资产及核对过的截图。

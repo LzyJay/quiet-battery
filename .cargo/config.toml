@@ -1,0 +1,9 @@
+[build]
+target-dir = ".build/target"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+TEMP = { value = ".build/tmp", relative = true, force = true }
+TMP = { value = ".build/tmp", relative = true, force = true }
