@@ -115,6 +115,9 @@ pub struct Inventory {
     errors: Vec<String>,
 }
 impl Inventory {
+    pub(super) fn is_complete(&self) -> bool {
+        self.complete && !self.truncated
+    }
     pub fn json(&self, identifiers: bool) -> String {
         let mut groups = BTreeMap::new();
         let mut rows: Vec<_> = self.collections.iter().collect();

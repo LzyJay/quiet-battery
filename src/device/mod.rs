@@ -1,7 +1,9 @@
 //! Read-only protocol adapters and common, device-independent battery values.
 mod bas;
+mod darmoshark;
 mod diagnostics;
 mod discovery;
+mod hid_io;
 mod logitech;
 use std::{
     fmt,
@@ -262,7 +264,11 @@ impl ProtocolAdapter for HidppAdapter {
         logitech::read_device(id, cancel)
     }
 }
-static ADAPTERS: &[&dyn ProtocolAdapter] = &[&HidppAdapter, &bas::BasAdapter];
+static ADAPTERS: &[&dyn ProtocolAdapter] = &[
+    &HidppAdapter,
+    &bas::BasAdapter,
+    &darmoshark::DarmosharkAdapter,
+];
 pub struct Registry;
 impl Registry {
     #[cfg(test)]
