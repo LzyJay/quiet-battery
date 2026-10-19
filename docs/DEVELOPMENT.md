@@ -71,5 +71,6 @@ Input / Output / Feature 长度来自零访问权限句柄的 `HidD_GetPreparsed
 
 1. 核对代码、支持范围、许可、截图；执行完整构建及必要真机检查。
 2. 从 `dist/quiet-battery.exe` 复制成品为 `quiet-battery-windows-x64.exe`，生成SHA256与简明说明。
-3. v0.2.0 使用正常稳定 Release（不标 prerelease），标为 latest；说明唯一真机基线和实验性协议边界。发布后重新下载成品，核对 SHA256、`--version` 与 Windows 文件/产品资源版本。
-4. 不上传缓存、本地data、原始validation、旧设计和机器身份。许可与第三方声明已编入EXE，也可附文本供查阅。
+3. v0.2.1 使用正常稳定 Release（不标 prerelease），标为 latest；说明G304、N3和标准蓝牙BAS的实际验证范围及未测场景，FL980保持搁置、未支持。发布后重新下载成品，核对 SHA256、`--version` 与 Windows 文件/产品资源版本。
+4. GitHub Releases仅保留最新2个；确认新版本成品核验通过后删除更旧的Release及其附件，保留Git标签，除非用户另有要求。
+5. 不上传缓存、本地data、原始validation、旧设计和机器身份。许可与第三方声明已编入EXE，也可附文本供查阅。
