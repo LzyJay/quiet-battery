@@ -1,6 +1,6 @@
 # Quiet Battery：代理与开发约定
 
-先读 README、`docs/ARCHITECTURE.md`、`docs/ADDING_DEVICES.md` 和 `docs/NEXT-TASKS.md`。视觉变更再读 `docs/DESIGN.md`。用户对当前任务的明确要求优先。
+先读 README、`docs/ARCHITECTURE.md`、`docs/ADDING_DEVICES.md`、`docs/DEVICE-SUPPORT.md` 和 `docs/NEXT-TASKS.md`。视觉变更再读 `docs/DESIGN.md`。用户对当前任务的明确要求优先。
 
 ## 产品与结构
 
@@ -35,5 +35,6 @@
 - 界面改动核对运行窗口与实际托盘，尊重用户对桌面输入的授权。设计稿或隐藏夹具不能代替真实可见截图。
 - 常驻逻辑改动检查单实例、正常退出、错误恢复与菜单响应。资源先测30秒，异常再延长；不裁剪工作集制造低数字。
 - `--diagnose` 为独立被动 HID 清单，不初始化电量适配器；只用零访问权限原生查询获取 caps，不打开 hidapi 输入缓冲、不读输入流、不发厂商报文、不采序列号。字段标来源和失败，默认隐藏路径/容器；显式标识符输出仅用于本机定位。总线、字符串和共享容器都不能证明零售品牌、无线制式、电量支持或外设槽位。数量/文本/时间有界，取消或截断须明确。
-- 原始验证留本地 `validation/`，公开文档只保留最新简明结果和必要截图；不要提交缓存、旧设计、个人路径、设备身份或凭据。发布并核对成品下载后，GitHub Releases仅保留最新两个已发布版本，清理更旧Release及附件，保留Git标签和提交历史；同步更新验证记录，具体步骤见 `docs/DEVELOPMENT.md`。
+- 原始验证留本地 `validation/`，公开文档只保留最新简明结果和必要截图；不要提交缓存、旧设计、个人路径、设备身份或凭据。从v0.3.0起按用户要求保留已有Release及附件，不再清理旧版本；发布并核对下载成品后更新验证记录，步骤见 `docs/DEVELOPMENT.md`。
+- Compx/Razer内置profile的协议实现与新型号真机验证分开记录，精确ID及未测场景见DEVICE-SUPPORT；不能把上游支持表当成本项目实测。
 - 新增依赖后更新第三方声明。维护PolyForm非商业许可与第三方原许可，不能擅自将第三方代码改成项目许可。

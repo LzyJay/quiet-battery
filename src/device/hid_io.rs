@@ -137,6 +137,15 @@ impl Session {
         lease: QueryGuard,
         cancel: &Cancellation,
     ) -> Result<Self, DeviceError> {
+        Self::open_access(path, key, lease, cancel, false)
+    }
+    pub fn open_access(
+        path: &str,
+        key: &str,
+        lease: QueryGuard,
+        cancel: &Cancellation,
+        feature_only: bool,
+    ) -> Result<Self, DeviceError> {
         cancel.check()?;
         {
             let mut p = lock_pending()?;
@@ -151,7 +160,11 @@ impl Session {
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                if feature_only {
+                    0
+                } else {
+                    GENERIC_READ | GENERIC_WRITE
+                },
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
@@ -201,7 +214,49 @@ impl Session {
         deadline: Instant,
         cancel: &Cancellation,
     ) -> Result<Option<Vec<u8>>, DeviceError> {
-        self.perform(vec![0u8; 33], None, deadline, cancel)
+        self.input_sized(33, deadline, cancel)
+    }
+    pub fn input_sized(
+        &self,
+        length: usize,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<Option<Vec<u8>>, DeviceError> {
+        self.perform(vec![0; checked_length(length)?], None, deadline, cancel)
+    }
+    pub fn output(
+        &self,
+        report: &[u8],
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<(), DeviceError> {
+        checked_length(report.len())?;
+        self.perform(report.to_vec(), Some(0), deadline, cancel)?
+            .map(|_| ())
+            .ok_or_else(|| DeviceError::Unavailable("HID output timed out".into()))
+    }
+    pub fn set_feature(
+        &self,
+        report: &[u8],
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<(), DeviceError> {
+        checked_length(report.len())?;
+        self.perform(report.to_vec(), Some(SET_FEATURE), deadline, cancel)?
+            .map(|_| ())
+            .ok_or_else(|| DeviceError::Unavailable("HID set feature timed out".into()))
+    }
+    pub fn get_feature(
+        &self,
+        id: u8,
+        length: usize,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<Vec<u8>, DeviceError> {
+        let mut buffer = vec![0; checked_length(length)?];
+        buffer[0] = id;
+        self.perform(buffer, Some(GET_FEATURE), deadline, cancel)?
+            .ok_or_else(|| DeviceError::Unavailable("HID get feature timed out".into()))
     }
     fn perform(
         &self,
@@ -234,6 +289,13 @@ impl Session {
                 // SET_FEATURE receives its report through the input buffer;
                 // GET_FEATURE uses the output buffer, initialized with report-ID.
                 // https://learn.microsoft.com/windows-hardware/drivers/ddi/hidclass/ni-hidclass-ioctl_hid_set_feature
+                Some(0) => WriteFile(
+                    op.device.handle.0,
+                    op.buffer.as_ptr(),
+                    op.buffer.len() as u32,
+                    null_mut(),
+                    op.overlapped.get(),
+                ),
                 Some(code) => DeviceIoControl(
                     op.device.handle.0,
                     code,
@@ -314,13 +376,30 @@ impl Session {
             }
             return outcome.map(|_| None);
         }
-        if code.is_none() {
+        if code.is_none() || code == Some(GET_FEATURE) {
+            if op.transferred as usize > op.buffer.len() {
+                return Err(DeviceError::Protocol(
+                    "HID returned impossible length".into(),
+                ));
+            }
             op.buffer.truncate(op.transferred as usize);
-        } else if code == Some(GET_FEATURE) && op.transferred < 14 {
-            return Err(DeviceError::Protocol("HID feature reply truncated".into()));
+        } else if code == Some(0) && op.transferred as usize != op.buffer.len() {
+            return Err(DeviceError::Protocol(
+                "HID output was not fully transferred".into(),
+            ));
         }
         cancel.check()?;
         Ok(Some(std::mem::take(&mut op.buffer)))
+    }
+}
+
+fn checked_length(length: usize) -> Result<usize, DeviceError> {
+    if (1..=4096).contains(&length) {
+        Ok(length)
+    } else {
+        Err(DeviceError::Protocol(
+            "HID report length out of bounds".into(),
+        ))
     }
 }
 
@@ -394,7 +473,7 @@ mod tests {
         let server = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
-                1 | FILE_FLAG_OVERLAPPED,
+                3 | FILE_FLAG_OVERLAPPED,
                 0,
                 1,
                 64,
@@ -419,7 +498,7 @@ mod tests {
         let raw_client = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE,
                 0,
                 null(),
                 OPEN_EXISTING,
@@ -449,6 +528,57 @@ mod tests {
             Err(DeviceError::Cancelled)
         ));
         thread.join().unwrap();
+        let cancel = Cancellation::default();
+        let frame = [8u8; 17];
+        session
+            .output(&frame, Instant::now() + Duration::from_secs(1), &cancel)
+            .unwrap();
+        let mut received = [0u8; 17];
+        let mut count = 0;
+        assert_ne!(
+            unsafe {
+                ReadFile(
+                    _client.0,
+                    received.as_mut_ptr(),
+                    received.len() as u32,
+                    &mut count,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!((received, count), (frame, 17));
+        assert_ne!(
+            unsafe {
+                WriteFile(
+                    _client.0,
+                    frame.as_ptr(),
+                    frame.len() as u32,
+                    &mut count,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            session
+                .input_sized(17, Instant::now() + Duration::from_secs(1), &cancel)
+                .unwrap()
+                .unwrap(),
+            frame
+        );
+        for length in [0, 4097, usize::MAX] {
+            assert!(
+                session
+                    .input_sized(length, Instant::now(), &cancel)
+                    .is_err()
+            );
+            assert!(
+                session
+                    .get_feature(0, length, Instant::now(), &cancel)
+                    .is_err()
+            );
+        }
         let mut p = lock_pending().unwrap();
         reap(&mut p);
         assert!(!p.operations.iter().any(|op| op.device.key == name));

@@ -1,10 +1,13 @@
 //! Read-only protocol adapters and common, device-independent battery values.
 mod bas;
+mod compx;
 mod darmoshark;
 mod diagnostics;
 mod discovery;
 mod hid_io;
 mod logitech;
+mod razer;
+mod vendor_hid;
 use std::{
     fmt,
     sync::{
@@ -268,6 +271,8 @@ static ADAPTERS: &[&dyn ProtocolAdapter] = &[
     &HidppAdapter,
     &bas::BasAdapter,
     &darmoshark::DarmosharkAdapter,
+    &compx::ADAPTER,
+    &razer::ADAPTER,
 ];
 pub struct Registry;
 impl Registry {

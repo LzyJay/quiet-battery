@@ -8,6 +8,16 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    let version = env::var("CARGO_PKG_VERSION").unwrap();
+    let component = |key| {
+        env::var(key)
+            .unwrap()
+            .parse::<u16>()
+            .expect("Windows version component exceeds 65535")
+    };
+    let major = component("CARGO_PKG_VERSION_MAJOR");
+    let minor = component("CARGO_PKG_VERSION_MINOR");
+    let patch = component("CARGO_PKG_VERSION_PATCH");
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let icon = root
@@ -15,9 +25,9 @@ fn main() {
         .to_string_lossy()
         .replace('\\', "/");
     let manifest = output.join("quiet-battery.manifest");
-    fs::write(&manifest, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    fs::write(&manifest, format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="0.2.3.0" processorArchitecture="*" name="QuietBattery" type="win32"/>
+  <assemblyIdentity version="{major}.{minor}.{patch}.0" processorArchitecture="*" name="QuietBattery" type="win32"/>
   <description>Quiet Battery native battery tray</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
     <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
@@ -27,7 +37,7 @@ fn main() {
     <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
     <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
   </windowsSettings></application>
-</assembly>"#).unwrap();
+</assembly>"#)).unwrap();
     let manifest_path = manifest.to_string_lossy().replace('\\', "/");
     let resource = output.join("quiet-battery.rc");
     fs::write(
@@ -37,8 +47,8 @@ fn main() {
 101 ICON "{icon}"
 1 24 "{manifest_path}"
 1 VERSIONINFO
-FILEVERSION 0,2,3,0
-PRODUCTVERSION 0,2,3,0
+FILEVERSION {major},{minor},{patch},0
+PRODUCTVERSION {major},{minor},{patch},0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -50,12 +60,12 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "FileDescription", "Quiet Battery - native peripheral battery monitor\0"
-      VALUE "FileVersion", "0.2.3\0"
+      VALUE "FileVersion", "{version}\0"
       VALUE "InternalName", "quiet-battery\0"
       VALUE "OriginalFilename", "quiet-battery.exe\0"
       VALUE "ProductName", "Quiet Battery\0"
       VALUE "LegalCopyright", "Copyright (c) 2026 TheWebDog\0"
-      VALUE "ProductVersion", "0.2.3\0"
+      VALUE "ProductVersion", "{version}\0"
     END
   END
   BLOCK "VarFileInfo"

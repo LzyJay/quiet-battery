@@ -60,6 +60,7 @@ fn open_session(
             channels,
             index,
             cancel: cancel.clone(),
+            deadline: Instant::now() + Duration::from_secs(5),
         })
     }
 }
@@ -74,7 +75,7 @@ pub(super) fn read_device(id: &str, cancel: &Cancellation) -> Result<Reading, De
     let index = parts
         .next()
         .and_then(|s| s.parse::<u8>().ok())
-        .filter(|i| (1..=6).contains(i))
+        .filter(|i| (1..=6).contains(i) || *i == 0xff)
         .ok_or(DeviceError::NotFound)?;
     let identity = parts.next().ok_or(DeviceError::NotFound)?;
     let (key, expected) = identity.rsplit_once('|').ok_or(DeviceError::NotFound)?;
@@ -100,14 +101,21 @@ fn scan_slots<T>(
     mut query: impl FnMut(u8) -> Result<T, DeviceError>,
 ) -> Result<SlotReplies<T>, DeviceError> {
     let mut replies = Vec::new();
-    for index in 1..=6 {
+    // Direct USB/Bluetooth HID++ endpoints address the device as FF. A receiver
+    // normally rejects it (or exposes HID++ 1.x), then its paired slots are queried.
+    // Prefer a successful direct address so aliasing firmware cannot create six copies.
+    for index in [0xff, 1, 2, 3, 4, 5, 6] {
         cancel.check()?;
         let result = query(index);
         cancel.check()?;
         if matches!(result, Err(DeviceError::Cancelled)) {
             return Err(DeviceError::Cancelled);
         }
+        let direct = index == 0xff && result.is_ok();
         replies.push((index, result));
+        if direct {
+            break;
+        }
     }
     Ok(replies)
 }
@@ -117,7 +125,12 @@ pub(super) fn discover(cancel: &Cancellation) -> Result<Vec<Candidate>, DeviceEr
     let api = HidApi::new().map_err(io)?;
     let groups = groups(&api);
     let mut candidates = Vec::new();
-    for (key, paths) in groups {
+    let began = Instant::now();
+    for (position, (key, paths)) in groups.into_iter().enumerate() {
+        if position >= 8 || began.elapsed() >= Duration::from_secs(30) {
+            // Return failure, not a partial successful inventory that could hide caches.
+            return Err(DeviceError::Unavailable("HID++发现预算用尽".into()));
+        }
         cancel.check()?;
         let mut found = false;
         let mut last_error = None;
@@ -255,7 +268,7 @@ fn parse_unified(
     }
     let power = match data[2] {
         0 => PowerState::Discharging,
-        1 | 2 => PowerState::Charging,
+        1 | 2 | 4 => PowerState::Charging,
         3 => PowerState::Full,
         _ => return Err(DeviceError::Unavailable("电池状态未确认".into())),
     };
@@ -375,12 +388,16 @@ struct Session {
     channels: Vec<Channel>,
     index: u8,
     cancel: Cancellation,
+    deadline: Instant,
 }
 
 impl Query for Session {
     // Private, and used exclusively by the allowlisted high-level queries below.
     fn query(&self, feature: u8, function: u8, params: &[u8]) -> Result<Vec<u8>, DeviceError> {
         self.cancel.check()?;
+        if Instant::now() >= self.deadline {
+            return Err(DeviceError::Unavailable("HID++事务预算用尽".into()));
+        }
         let sid = SEQUENCE.fetch_add(1, Ordering::Relaxed) % 15 + 1;
         let command = (function << 4) | sid;
         let channel = &self.channels[0];
@@ -395,7 +412,7 @@ impl Query for Session {
         // windows-native may report zero on synchronous success, or the padded
         // output length on async success; only Err is a reliable write failure.
         channel.device.write(&report[..length]).map_err(io)?;
-        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        let deadline = (Instant::now() + RESPONSE_TIMEOUT).min(self.deadline);
         loop {
             self.cancel.check()?;
             for channel in &self.channels {
@@ -505,7 +522,7 @@ fn parse_battery(data: &[u8]) -> Result<(Level, u8, u8, PowerState), DeviceError
     }
     let state = match data[2] {
         0 => PowerState::Discharging,
-        1 | 2 => PowerState::Charging,
+        1 | 2 | 4 => PowerState::Charging,
         3 => PowerState::Full,
         n => PowerState::Unknown(n),
     };
@@ -605,6 +622,80 @@ mod tests {
         assert!(transport.steps.borrow().is_empty());
     }
     #[test]
+    fn direct_address_prevents_duplicate_aliases_and_receiver_slots_still_scan() {
+        let cancel = Cancellation::default();
+        let mut seen = Vec::new();
+        let direct = scan_slots(&cancel, |index| {
+            seen.push(index);
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(seen, [0xff]);
+        assert_eq!(direct.len(), 1);
+        seen.clear();
+        let receiver = scan_slots(&cancel, |index| {
+            seen.push(index);
+            if matches!(index, 1 | 3) {
+                Ok(index)
+            } else {
+                Err(DeviceError::Unsupported("not a device slot".into()))
+            }
+        })
+        .unwrap();
+        assert_eq!(seen, [0xff, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(receiver.iter().filter(|(_, r)| r.is_ok()).count(), 2);
+        let mut report = [0u8; 20];
+        report[..7].copy_from_slice(&[0x11, 0xff, 7, 0x12, 64, 0, 0]);
+        assert!(matches!(
+            match_reply(&report, 0xff, 7, 0x12),
+            Reply::Success(_)
+        ));
+        assert_eq!(match_reply(&report, 1, 7, 0x12), Reply::Unrelated);
+    }
+    #[test]
+    fn generic_name_type_and_both_battery_families_do_not_require_g304() {
+        // Synthetic transcripts exercise routing, not real-model compatibility claims.
+        for (name, kind_byte, kind) in [
+            ("PRO Wireless", 3, DeviceKind::Mouse),
+            ("PRO X SUPERLIGHT", 3, DeviceKind::Mouse),
+            ("G502 LIGHTSPEED", 3, DeviceKind::Mouse),
+            ("MX Master 3S", 3, DeviceKind::Mouse),
+            ("MX Keys", 0, DeviceKind::Keyboard),
+        ] {
+            for unified in [false, true] {
+                let mut steps = transcript_prefix(Ok(vec![0]));
+                steps[2].3 = Ok(vec![name.len() as u8]);
+                steps[3].3 = Ok(name.as_bytes().to_vec());
+                steps[4].3 = Ok(vec![kind_byte]);
+                if unified {
+                    steps.extend([
+                        (0, 0, Some(vec![0x10, 0]), Ok(vec![0])),
+                        (0, 0, Some(vec![0x10, 4]), Ok(vec![7])),
+                        (7, 0, Some(vec![]), Ok(vec![15, 2])),
+                        (7, 1, Some(vec![]), Ok(vec![64, 4, 1, 1])),
+                    ]);
+                } else {
+                    steps.extend([
+                        (0, 0, Some(vec![0x10, 0]), Ok(vec![5])),
+                        (5, 1, Some(vec![]), Ok(vec![100, 2])),
+                        (5, 0, Some(vec![]), Ok(vec![64, 50, 4])),
+                    ]);
+                }
+                let transport = Transcript {
+                    steps: std::cell::RefCell::new(steps.into()),
+                };
+                let (actual_kind, r, _) = query_device(&transport).unwrap();
+                assert_eq!(actual_kind, kind);
+                assert_eq!(r.device_name, name);
+                assert_eq!(
+                    (r.normalized_percent(), r.power_state),
+                    (64, PowerState::Charging)
+                );
+                assert!(transport.steps.borrow().is_empty());
+            }
+        }
+    }
+    #[test]
     fn identity_falls_back_only_when_feature_is_absent() {
         for error in [
             DeviceError::Unavailable("timeout".into()),
@@ -673,7 +764,12 @@ mod tests {
         assert_eq!(zero.normalized_percent(), 0);
         assert_eq!(zero.source, super::super::BatterySource::ReportedPercent);
         assert!(parse_unified("Levels".into(), (4, 2), &[3, 0], &[0, 4, 0, 0]).is_err());
-        assert!(parse_unified("Fine".into(), (4, 2), &[15, 2], &[90, 4, 4, 0]).is_err());
+        assert_eq!(
+            parse_unified("Fine".into(), (4, 2), &[15, 2], &[90, 4, 4, 0])
+                .unwrap()
+                .power_state,
+            PowerState::Charging
+        );
         assert!(parse_unified("None".into(), (4, 2), &[0, 0], &[0, 0, 0, 0]).is_err());
         assert!(parse_unified("Truncated".into(), (4, 2), &[15], &[90, 4, 0, 0]).is_err());
     }
@@ -809,7 +905,7 @@ mod tests {
             &[90, 101, 0],
             &[0, 0, 1],
             &[0, 0, 7],
-            &[90, 50, 4],
+            &[90, 50, 5],
         ] {
             assert!(parse_battery(data).is_err());
         }

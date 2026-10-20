@@ -2,7 +2,7 @@
 
 ## 构建
 
-Windows x64、Rust stable、MSVC工具链与Windows SDK。当前验证工具链为Rust1.94.0。Cargo.lock锁定依赖，缓存留在 `.build/`。
+Windows x64、Rust stable、MSVC工具链与Windows SDK。当前验证工具链为Rust1.94.0。Cargo.lock锁定依赖，缓存留在 `.build/`。Windows文件/产品资源及manifest版本从Cargo包版本生成，升级不另改硬编码版本号。
 
 ```powershell
 ./tools/build.ps1                # fmt、test、Clippy、release，复制到dist
@@ -81,6 +81,6 @@ Input / Output / Feature 长度来自零访问权限句柄的 `HidD_GetPreparsed
 
 1. 核对代码、支持范围、许可、截图；执行完整构建及必要真机检查。
 2. 从 `dist/quiet-battery.exe` 复制成品为 `quiet-battery-windows-x64.exe`，生成SHA256与简明说明。
-3. 正常版本使用稳定 Release（不标 prerelease），标为 latest；说明G304、N3和标准蓝牙BAS的实际验证范围及未测场景，FL980保持搁置、未支持。发布后重新下载成品，核对 SHA256、`--version` 与 Windows 文件/产品资源版本。
-4. GitHub Releases仅保留按发布时间排序的最新2个已发布版本。确认新版EXE和附件下载核验通过，且保留的两个版本附件齐全后，再删除更旧的Release及其附件；不删除Git标签或提交历史，不使用 `--cleanup-tag`。同步更新验证记录；历史发布记录使用“当时”表述，避免误认成当前版本列表。
+3. 正常版本使用稳定 Release（不标 prerelease），标为 latest；说明G304、N3、标准蓝牙BAS及新增协议/型号的实际验证范围与未测场景，FL980保持搁置、未支持。发布后重新下载成品，核对 SHA256、`--version` 与 Windows 文件/产品资源版本。
+4. 从v0.3.0起保留既有Release及附件，不再执行旧版清理规则；Git标签和提交历史同样保留。说明哪些设备有本项目真机证据、哪些仅有协议/夹具证据。
 5. 不上传缓存、本地data、原始validation、旧设计和机器身份。许可与第三方声明已编入EXE，也可附文本供查阅。
