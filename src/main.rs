@@ -7,6 +7,7 @@ mod launch;
 mod licenses;
 mod manager;
 mod notifications;
+mod save_dialog;
 mod startup;
 mod status_ipc;
 mod storage;
@@ -59,6 +60,7 @@ fn main() {
         None
     };
     let result = match argument.as_deref() {
+        Some("--support-save-dialog") => save_dialog::run_helper(std::env::args().nth(2)),
         Some("--licenses") => {
             output(licenses::TEXT);
             Ok(())

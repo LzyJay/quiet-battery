@@ -830,9 +830,250 @@ impl ProtocolAdapter for BasAdapter {
         read(id, cancel)
     }
 }
+fn support_characteristic(
+    service: &GattDeviceService,
+    short: u32,
+    cancel: &Cancellation,
+    deadline: Instant,
+) -> Result<String, DeviceError> {
+    use crate::app::json_string as q;
+    let chars = wait(
+        service
+            .GetCharacteristicsForUuidAsync(uuid(short))
+            .map_err(error)?,
+        cancel,
+        deadline,
+    )?;
+    let cs = chars.Status().map_err(error)?;
+    if cs != GattCommunicationStatus::Success {
+        return Ok(format!(
+            "{{\"uuid\":\"{short:04X}\",\"lookup_status\":{},\"present\":null}}",
+            cs.0
+        ));
+    }
+    let chars = chars.Characteristics().map_err(error)?;
+    let count = chars.Size().map_err(error)?;
+    if count == 0 {
+        return Ok(format!("{{\"uuid\":\"{short:04X}\",\"present\":false}}"));
+    }
+    // Ambiguous duplicate standard characteristics are reported, not chosen arbitrarily.
+    if count != 1 {
+        return Ok(format!(
+            "{{\"uuid\":\"{short:04X}\",\"present\":true,\"count\":{count},\"read\":null}}"
+        ));
+    }
+    let characteristic = chars.GetAt(0).map_err(error)?;
+    let props = characteristic.CharacteristicProperties().map_err(error)?;
+    let value = if props.contains(GattCharacteristicProperties::Read) {
+        let r = wait(
+            characteristic
+                .ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)
+                .map_err(error)?,
+            cancel,
+            deadline,
+        )?;
+        if r.Status().map_err(error)? == GattCommunicationStatus::Success {
+            if short == 0x2a19 {
+                match from_buffer(&r.Value().map_err(error)?, "diagnostic") {
+                    Ok(reading) => format!(
+                        "{{\"status\":\"success\",\"percent\":{}}}",
+                        reading.normalized_percent()
+                    ),
+                    Err(e) => format!(
+                        "{{\"status\":\"invalid_value\",\"reason\":{}}}",
+                        q(&e.to_string())
+                    ),
+                }
+            } else {
+                match status_buffer(&r.Value().map_err(error)?) {
+                    Ok(power) => format!(
+                        "{{\"status\":\"success\",\"power_state\":{}}}",
+                        q(&format!("{power:?}"))
+                    ),
+                    Err(e) => format!(
+                        "{{\"status\":\"invalid_value\",\"reason\":{}}}",
+                        q(&e.to_string())
+                    ),
+                }
+            }
+        } else {
+            format!(
+                "{{\"status\":\"gatt_error\",\"code\":{}}}",
+                r.Status().map_err(error)?.0
+            )
+        }
+    } else {
+        "{\"status\":\"not_readable\"}".into()
+    };
+    Ok(format!(
+        "{{\"uuid\":\"{short:04X}\",\"present\":true,\"properties\":{{\"read\":{},\"notify\":{},\"indicate\":{}}},\"read\":{value}}}",
+        props.contains(GattCharacteristicProperties::Read),
+        props.contains(GattCharacteristicProperties::Notify),
+        props.contains(GattCharacteristicProperties::Indicate)
+    ))
+}
+
+fn support_fields(
+    mut query: impl FnMut(u32) -> Result<String, DeviceError>,
+) -> Result<Vec<String>, DeviceError> {
+    let mut rows = Vec::new();
+    for short in [0x2a19, 0x2bed] {
+        rows.push(match query(short) {
+            Ok(row) => row,
+            Err(DeviceError::Cancelled) => return Err(DeviceError::Cancelled),
+            Err(error) => format!(
+                "{{\"uuid\":\"{short:04X}\",\"status\":\"query_failed\",\"error\":{}}}",
+                super::support::error_json(Some(&error))
+            ),
+        });
+    }
+    Ok(rows)
+}
+
+/// Selected-device, read-only BAS diagnostic. Does not pair, request consent,
+/// subscribe/unsubscribe or update monitor caches/alert cycles.
+pub(super) fn support_information(
+    target: &DeviceDescriptor,
+    cancel: &Cancellation,
+) -> Result<String, DeviceError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    cancel.check()?;
+    let selector = BluetoothLEDevice::GetDeviceSelectorFromPairingState(true).map_err(error)?;
+    let properties = windows_collections::IIterable::<HSTRING>::from(vec![HSTRING::from(
+        "System.Devices.Aep.ContainerId",
+    )]);
+    let found = wait(
+        DeviceInformation::FindAllAsyncWithKindAqsFilterAndAdditionalProperties(
+            &selector,
+            &properties,
+            DeviceInformationKind::AssociationEndpoint,
+        )
+        .map_err(error)?,
+        cancel,
+        deadline,
+    )?;
+    let count = found.Size().map_err(error)?;
+    if count > 32 {
+        return Err(DeviceError::Unavailable("BLE诊断候选数量超限".into()));
+    }
+    for index in 0..count {
+        cancel.check()?;
+        let info = found.GetAt(index).map_err(error)?;
+        let id = info.Id().map_err(error)?.to_string();
+        // Identity only: never match a BLE peer by its product/display name.
+        if container_for(&info, &id) != target.physical_id {
+            continue;
+        }
+        let permission = DeviceAccessInformation::CreateFromId(&HSTRING::from(&id))
+            .and_then(|a| a.CurrentStatus())
+            .map_err(error)?;
+        if permission != DeviceAccessStatus::Allowed {
+            return Ok(format!(
+                "{{\"status\":\"permission_not_allowed\",\"access_status\":{},\"paired\":true,\"services\":null}}",
+                permission.0
+            ));
+        }
+        let owner = if let Some(owner) = SESSIONS.with(|s| {
+            s.borrow()
+                .values()
+                .find(|s| s.device.id == id)
+                .map(|s| s.device.clone())
+        }) {
+            owner
+        } else {
+            Rc::new(DeviceHandle {
+                device: wait(
+                    BluetoothLEDevice::FromIdAsync(&HSTRING::from(&id)).map_err(error)?,
+                    cancel,
+                    deadline,
+                )?,
+                id: id.clone(),
+            })
+        };
+        if owner.device.ConnectionStatus().map_err(error)? != BluetoothConnectionStatus::Connected {
+            return Ok("{\"status\":\"disconnected\",\"paired\":true,\"access_status\":\"allowed\",\"services\":null}".into());
+        }
+        let result = wait(
+            owner
+                .device
+                .GetGattServicesForUuidWithCacheModeAsync(
+                    uuid(0x180f),
+                    BluetoothCacheMode::Uncached,
+                )
+                .map_err(error)?,
+            cancel,
+            deadline,
+        )?;
+        let status = result.Status().map_err(error)?;
+        if status != GattCommunicationStatus::Success {
+            return Ok(format!(
+                "{{\"status\":\"service_lookup_failed\",\"gatt_status\":{},\"services\":null}}",
+                status.0
+            ));
+        }
+        let services = result.Services().map_err(error)?;
+        let length = services.Size().map_err(error)?;
+        let mut rows = Vec::new();
+        for n in 0..length.min(4) {
+            cancel.check()?;
+            let service = services.GetAt(n).map_err(error)?;
+            let handle = service.AttributeHandle().map_err(error)?;
+            let existing = SESSIONS.with(|s| {
+                s.borrow()
+                    .values()
+                    .find(|s| s.device.id == id && s.service.AttributeHandle().ok() == Some(handle))
+                    .map(|s| s.value_token.is_some())
+            });
+            // If Windows returned a service already retained by monitoring,
+            // do not Close an aliased service and invalidate that session.
+            struct ServiceGuard(GattDeviceService, bool);
+            impl Drop for ServiceGuard {
+                fn drop(&mut self) {
+                    if self.1 {
+                        let _ = self.0.Close();
+                    }
+                }
+            }
+            let guard = ServiceGuard(service, existing.is_none());
+            let characteristics =
+                support_fields(|short| support_characteristic(&guard.0, short, cancel, deadline))?;
+            rows.push(format!("{{\"uuid\":\"180F\",\"attribute_handle\":{handle},\"monitor_subscription_active\":{},\"characteristics\":[{}]}}",
+                existing.map_or_else(||"null".into(),|v|v.to_string()),characteristics.join(",")));
+        }
+        cancel.check()?;
+        return Ok(format!(
+            "{{\"status\":\"success\",\"paired\":true,\"connected\":true,\"access_status\":\"allowed\",\"battery_service_present\":{},\"truncated\":{},\"services\":[{}]}}",
+            length > 0,
+            length > 4,
+            rows.join(",")
+        ));
+    }
+    Ok("{\"status\":\"no_matching_paired_ble_endpoint\",\"battery_service_present\":null,\"note\":\"No physical-identity match; this does not prove BAS absence or rule out classic Bluetooth\"}".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn support_optional_failure_keeps_mandatory_evidence_and_cancel_is_not_partial_success() {
+        let mut calls = Vec::new();
+        let rows = support_fields(|short| {
+            calls.push(short);
+            if short == 0x2a19 {
+                Ok("{\"percent\":35}".into())
+            } else {
+                Err(DeviceError::Io(r"permission C:\Users\PRIVATE\file".into()))
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, [0x2a19, 0x2bed]);
+        assert_eq!(rows[0], "{\"percent\":35}");
+        assert!(rows[1].contains("query_failed") && !rows[1].contains("PRIVATE"));
+        assert!(matches!(
+            support_fields(|_| Err(DeviceError::Cancelled)),
+            Err(DeviceError::Cancelled)
+        ));
+    }
     #[test]
     fn pending_wait_times_out_and_cancels_after_wait_started() {
         use std::sync::atomic::{AtomicBool, Ordering};

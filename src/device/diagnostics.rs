@@ -115,6 +115,15 @@ pub struct Inventory {
     errors: Vec<String>,
 }
 impl Inventory {
+    pub(super) fn selected(mut self, physical: &str) -> Self {
+        self.collections.retain(|c| c.key() == physical);
+        self.collections.sort_by(|a, b| a.path.cmp(&b.path));
+        if self.collections.len() > 32 {
+            self.collections.truncate(32);
+            self.truncated = true;
+        }
+        self
+    }
     pub(super) fn is_complete(&self) -> bool {
         self.complete && !self.truncated
     }
@@ -646,6 +655,53 @@ pub fn inventory(cancel: &Cancellation) -> Result<Inventory, DeviceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_report_excludes_unrelated_devices_and_hides_local_identity() {
+        let a = Collection {
+            path: r"\\?\hid#PRIVATE_A".into(),
+            container: Some("target".into()),
+            fields: [("product", Field::text(Some("chosen model"), "fixture"))].into(),
+            errors: vec![],
+        };
+        let b = Collection {
+            path: r"\\?\hid#PRIVATE_B".into(),
+            container: Some("unrelated".into()),
+            fields: [("product", Field::text(Some("unrelated model"), "fixture"))].into(),
+            errors: vec![],
+        };
+        let report = Inventory {
+            collections: vec![a, b],
+            complete: false,
+            truncated: false,
+            errors: vec!["partial enumeration".into()],
+        }
+        .selected("target");
+        let json = report.json(false);
+        assert_eq!(report.collections.len(), 1);
+        assert!(json.contains("chosen model"));
+        assert!(
+            !json.contains("unrelated model")
+                && !json.contains("PRIVATE_A")
+                && !json.contains("target")
+        );
+        assert!(json.contains("\"complete\":false") && json.contains("partial enumeration"));
+        let many = (0..33)
+            .map(|n| Collection {
+                path: format!("fixture{n}"),
+                container: Some("target".into()),
+                ..Default::default()
+            })
+            .collect();
+        let capped = Inventory {
+            collections: many,
+            complete: true,
+            truncated: false,
+            errors: vec![],
+        }
+        .selected("target");
+        assert_eq!(capped.collections.len(), 32);
+        assert!(capped.json(false).contains("\"truncated\":true"));
+    }
     #[test]
     fn privacy_escaping_and_partial_fields() {
         let mut c = Collection {

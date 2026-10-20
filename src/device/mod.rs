@@ -7,6 +7,7 @@ mod discovery;
 mod hid_io;
 mod logitech;
 mod razer;
+pub mod support;
 mod vendor_hid;
 use std::{
     fmt,
@@ -15,6 +16,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+pub use support::SupportContext;
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<AtomicBool>);
 impl Cancellation {

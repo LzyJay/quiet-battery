@@ -2,6 +2,7 @@
 use crate::{
     device::{
         Cancellation, Candidate, DeviceError, DeviceKind, DiscoveryReport, Reading, Registry,
+        SupportContext,
     },
     icons::{BatteryVisual, SymbolIcon, TrayIcon},
     manager::{self, DeviceState, Manager},
@@ -90,6 +91,7 @@ impl Page {
 enum WorkerCommand {
     Discover(bool),
     Read(Vec<String>, bool),
+    Support(u64, Box<SupportContext>, SupportDestination, Cancellation),
     Stop,
 }
 enum WorkerResult {
@@ -97,6 +99,20 @@ enum WorkerResult {
     Reading(String, Result<Reading, DeviceError>),
     Complete,
     RefreshRequest(String),
+    Support(u64, Result<Option<String>, DeviceError>),
+}
+#[derive(Clone)]
+enum SupportDestination {
+    Clipboard,
+    File(PathBuf),
+    #[cfg(not(test))]
+    FileDialog(usize),
+}
+struct SupportJob {
+    token: u64,
+    id: String,
+    cancel: Cancellation,
+    file: bool,
 }
 #[derive(Clone, Default)]
 struct PanelView {
@@ -210,6 +226,8 @@ type NotificationSink = Box<dyn FnMut(&str, u8) -> bool>;
 struct TestEffects {
     state_path: Option<PathBuf>,
     notification_sink: Option<NotificationSink>,
+    support_copies: Vec<String>,
+    support_path: Option<PathBuf>,
 }
 struct App {
     #[cfg(test)]
@@ -228,6 +246,9 @@ struct App {
     busy: bool,
     pending: bool,
     pending_discovery: bool,
+    support_job: Option<SupportJob>,
+    support_sequence: u64,
+    support_feedback: Option<(String, bool)>,
     simulated: bool,
     refresh_count: u64,
     success_count: u64,
@@ -558,11 +579,42 @@ impl App {
                                 } else if state.descriptor.supported {
                                     "添加"
                                 } else {
-                                    "复制信息"
+                                    "—"
                                 })
                                 .as_ptr(),
                             );
-                            EnableWindow(row.refresh, i32::from(!state.selected));
+                            EnableWindow(
+                                row.refresh,
+                                i32::from(state.descriptor.supported && !state.selected),
+                            );
+                            for (index, h) in row.extra.iter().enumerate() {
+                                let file = index == 1;
+                                let active = self
+                                    .support_job
+                                    .as_ref()
+                                    .is_some_and(|job| job.id == row.id && job.file == file);
+                                let done = self
+                                    .support_feedback
+                                    .as_ref()
+                                    .is_some_and(|(id, f)| *id == row.id && *f == file);
+                                SetWindowTextW(
+                                    *h,
+                                    wide(if active {
+                                        "采集中"
+                                    } else if done {
+                                        if file { "已导出" } else { "已复制" }
+                                    } else if file {
+                                        "导出文件"
+                                    } else {
+                                        "复制信息"
+                                    })
+                                    .as_ptr(),
+                                );
+                                EnableWindow(
+                                    *h,
+                                    i32::from(!self.busy && self.support_job.is_none()),
+                                );
+                            }
                         }
                     }
                 }
@@ -637,6 +689,7 @@ impl App {
                     }
                     WorkerResult::Complete => WorkerResult::Complete,
                     WorkerResult::RefreshRequest(id) => WorkerResult::RefreshRequest(id),
+                    result @ WorkerResult::Support(_, _) => result,
                 }
             } else {
                 result
@@ -654,12 +707,7 @@ impl App {
                         .count() as u64;
                     self.manager.merge_discovery(report, now());
                     if self.page == Page::Add {
-                        for state in self
-                            .manager
-                            .devices
-                            .iter()
-                            .filter(|s| s.connected && !s.selected)
-                        {
+                        for state in self.manager.devices.iter().filter(|s| s.connected) {
                             if !self.picker_ids.contains(&state.descriptor.id) {
                                 self.picker_ids.push(state.descriptor.id.clone());
                             }
@@ -698,6 +746,7 @@ impl App {
                     }
                 }
                 WorkerResult::RefreshRequest(id) => self.refresh_ids(vec![id]),
+                WorkerResult::Support(token, result) => self.complete_support(token, result),
             }
             self.update_icons(false);
             if fresh_result {
@@ -706,6 +755,97 @@ impl App {
                 self.prune_alerts();
             }
             self.publish_view();
+        }
+    }
+    fn cancel_support(&mut self) {
+        if let Some(job) = self.support_job.take() {
+            job.cancel.cancel();
+        }
+        self.support_feedback = None;
+    }
+    fn request_support(&mut self, id: &str, file: bool) {
+        if self.busy || self.support_job.is_some() || self.page != Page::Add {
+            return;
+        }
+        let Some(state) = self.manager.devices.iter().find(|s| s.descriptor.id == id) else {
+            return;
+        };
+        let context = SupportContext {
+            descriptor: state.descriptor.clone(),
+            reading: state.reading.clone(),
+            last_success: state.last_success,
+            error: state.error.clone(),
+            connected: state.connected,
+            connection_known: state.connection_known,
+        };
+        let destination = if file {
+            #[cfg(test)]
+            {
+                let Some(path) = self.effects.support_path.clone() else {
+                    return;
+                };
+                SupportDestination::File(path)
+            }
+            #[cfg(not(test))]
+            {
+                SupportDestination::FileDialog(self.panel as usize)
+            }
+        } else {
+            SupportDestination::Clipboard
+        };
+        self.support_sequence = self.support_sequence.wrapping_add(1);
+        let token = self.support_sequence;
+        let cancel = Cancellation::default();
+        if self
+            .sender
+            .send(WorkerCommand::Support(
+                token,
+                Box::new(context),
+                destination,
+                cancel.clone(),
+            ))
+            .is_err()
+        {
+            self.operation_error("无法启动适配信息采集");
+            return;
+        }
+        self.support_feedback = None;
+        self.support_job = Some(SupportJob {
+            token,
+            id: id.into(),
+            cancel,
+            file,
+        });
+        self.busy = true;
+        self.publish_view();
+    }
+    fn complete_support(&mut self, token: u64, result: Result<Option<String>, DeviceError>) {
+        if self
+            .support_job
+            .as_ref()
+            .is_none_or(|job| job.token != token)
+        {
+            return;
+        }
+        let job = self.support_job.take().unwrap();
+        if job.cancel.check().is_err() || self.page != Page::Add || self.panel.is_null() {
+            return;
+        }
+        match result {
+            Ok(json) => {
+                if let Some(json) = json {
+                    #[cfg(test)]
+                    self.effects.support_copies.push(json);
+                    #[cfg(not(test))]
+                    if let Err(error) = copy_text(self.panel, &json) {
+                        self.operation_error(&error);
+                        return;
+                    }
+                }
+                self.support_feedback = Some((job.id, job.file));
+            }
+            Err(DeviceError::Cancelled) => {}
+            Err(error) => self.operation_error(&format!("适配信息采集失败：{error}")),
         }
     }
     fn prune_alerts(&mut self) {
@@ -1247,9 +1387,18 @@ impl App {
                         }
                     }
                     Page::Add => {
-                        self.place(row.model, 64, y + 6, 288, 40, 1);
-                        self.place(row.percent, 364, y + 6, 80, 40, 0);
-                        self.place(row.refresh, 466, y + 6, 70, 36, 0);
+                        self.place(row.model, 64, y + 6, 184, 40, 1);
+                        self.place(row.percent, 250, y + 6, 60, 40, 0);
+                        self.place(row.refresh, 490, y + 6, 54, 36, 0);
+                        if !row.presentation.3 {
+                            ShowWindow(row.refresh, SW_HIDE);
+                        }
+                        if let Some(copy) = row.extra.first() {
+                            self.place(*copy, 314, y + 6, 82, 36, 0);
+                        }
+                        if let Some(export) = row.extra.get(1) {
+                            self.place(*export, 400, y + 6, 82, 36, 0);
+                        }
                     }
                 }
             }
@@ -1421,15 +1570,28 @@ impl App {
                             if state.descriptor.supported {
                                 "添加"
                             } else {
-                                "复制信息"
+                                "—"
                             },
                             WS_TABSTOP | BS_PUSHBUTTON as u32,
-                            ADD_BASE + index as u32,
+                            ADD_BASE + index as u32 * 3,
                         ),
                     ),
                 };
                 if self.page != Page::Settings {
                     style_control(refresh, false);
+                }
+                if self.page == Page::Add {
+                    for (action, label) in [(1, "复制信息"), (2, "导出文件")] {
+                        let h = create_child(
+                            self.panel,
+                            "BUTTON",
+                            label,
+                            WS_TABSTOP | BS_PUSHBUTTON as u32,
+                            ADD_BASE + index as u32 * 3 + action,
+                        );
+                        style_control(h, false);
+                        extra.push(h);
+                    }
                 }
                 let mut text = wide(&state.descriptor.name);
                 let tooltip = CreateWindowExW(
@@ -1608,6 +1770,7 @@ impl App {
         }
     }
     fn switch_page(&mut self, page: Page) {
+        self.cancel_support();
         self.page_scroll[self.page.index()] = self.scroll;
         self.threshold_error = false;
         self.clear_rows();
@@ -1618,7 +1781,7 @@ impl App {
                 .manager
                 .devices
                 .iter()
-                .filter(|s| s.connected && !s.selected)
+                .filter(|s| s.connected)
                 .map(|s| s.descriptor.id.clone())
                 .collect();
         }
@@ -1699,6 +1862,7 @@ impl App {
         self.page_controls.clear();
     }
     fn close_panel(&mut self) {
+        self.cancel_support();
         self.close_picker();
         let panel = std::mem::replace(&mut self.panel, null_mut());
         if !panel.is_null() {
@@ -1728,7 +1892,7 @@ impl App {
                     .manager
                     .devices
                     .iter()
-                    .filter(|s| s.connected && !s.selected)
+                    .filter(|s| s.connected)
                     .map(|s| s.descriptor.id.clone())
                     .collect();
                 self.rebuild_rows();
@@ -1784,50 +1948,20 @@ impl App {
                 }
             }
             id if id >= ADD_BASE => {
-                if let Some(row) = self.rows.get((id - ADD_BASE) as usize) {
+                let index = ((id - ADD_BASE) / 3) as usize;
+                let action = (id - ADD_BASE) % 3;
+                if let Some(row) = self.rows.get(index) {
                     let device_id = row.id.clone();
-                    let supported = self
-                        .manager
-                        .devices
-                        .iter()
-                        .any(|s| s.descriptor.id == device_id && s.descriptor.supported);
-                    if supported {
+                    if action != 0 {
+                        self.request_support(&device_id, action == 2);
+                    } else if self.manager.devices.iter().any(|s| {
+                        s.descriptor.id == device_id && s.descriptor.supported && !s.selected
+                    }) {
                         self.manager.select(&device_id);
                         self.persist();
                         self.update_icons(false);
                         self.publish_view();
-                        self.refresh_ids(vec![device_id.clone()]);
-                        unsafe {
-                            let next = self
-                                .rows
-                                .iter()
-                                .skip((id - ADD_BASE) as usize + 1)
-                                .find(|r| IsWindowEnabled(r.refresh) != 0)
-                                .map_or(GetDlgItem(self.panel, PICK_REFRESH as i32), |r| r.refresh);
-                            if !cfg!(test) {
-                                windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(next);
-                            }
-                        }
-                    } else if let Some(state) = self
-                        .manager
-                        .devices
-                        .iter()
-                        .find(|s| s.descriptor.id == device_id)
-                    {
-                        let mut info = format!(
-                            "型号: {}\r\n类型: {}\r\n发现方式: {}\r\n设备身份: {}",
-                            state.descriptor.name,
-                            state.descriptor.kind.key(),
-                            state.descriptor.provider,
-                            state.descriptor.id
-                        );
-                        if let Some(details) = Registry::diagnostic_information(&state.descriptor) {
-                            info.push_str("\r\n");
-                            info.push_str(&details);
-                        }
-                        if let Err(e) = copy_text(self.panel, &info) {
-                            self.operation_error(&e);
-                        }
+                        self.refresh_ids(vec![device_id]);
                     }
                 }
             }
@@ -1887,9 +2021,14 @@ impl App {
             if self.page == Page::Settings {
                 targets.push((row.percent, Some(index)));
             }
-            targets.push((row.refresh, Some(index)));
+            if self.page != Page::Add {
+                targets.push((row.refresh, Some(index)));
+            }
             for h in &row.extra {
                 targets.push((*h, Some(index)));
+            }
+            if self.page == Page::Add {
+                targets.push((row.refresh, Some(index)));
             }
         }
         if self.page == Page::Main {
@@ -2091,7 +2230,7 @@ impl App {
                             self.page_command(if page == Page::Settings {
                                 SETTINGS_BASE + index as u32 * 3 + action
                             } else {
-                                ADD_BASE + index as u32
+                                ADD_BASE + index as u32 * 3 + action
                             });
                         }
                     }
@@ -2113,6 +2252,7 @@ impl App {
                 }
                 UiEvent::PanelDestroyed(hwnd) => {
                     if self.panel == hwnd {
+                        self.cancel_support();
                         self.panel = null_mut();
                         self.release_panel_resources();
                     }
@@ -2205,6 +2345,7 @@ unsafe fn create_child(parent: HWND, class: &str, text: &str, style: u32, id: u3
         )
     }
 }
+#[cfg(not(test))]
 fn copy_text(hwnd: HWND, text: &str) -> Result<(), String> {
     use windows_sys::Win32::System::{DataExchange::*, Memory::*};
     unsafe {
@@ -2728,7 +2869,7 @@ unsafe fn draw_control_colors(hwnd: HWND, checkbox: bool, dc: HDC, colors: &Pane
                 );
             }
         } else {
-            let primary = control_id >= ADD_BASE && text != "复制信息";
+            let primary = control_id >= ADD_BASE && (control_id - ADD_BASE) % 3 == 0;
             if primary || hovered || pushed {
                 SetDCPenColor(dc, if primary { colors.fill } else { colors.empty });
                 SetDCBrushColor(
@@ -2928,7 +3069,7 @@ unsafe extern "system" fn panel_proc(
             id if id >= SETTINGS_BASE => {
                 let view = bridge.view.borrow();
                 let (index, action) = if id >= ADD_BASE {
-                    ((id - ADD_BASE) as usize, 0)
+                    (((id - ADD_BASE) / 3) as usize, (id - ADD_BASE) % 3)
                 } else {
                     (
                         ((id - SETTINGS_BASE) / 3) as usize,
@@ -3363,6 +3504,33 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
                             };
                             let _ = results.send(WorkerResult::Discovery(report));
                         }
+                        WorkerCommand::Support(token, context, destination, cancel) => {
+                            let result = (|| {
+                                let destination = match destination {
+                                    #[cfg(not(test))]
+                                    SupportDestination::FileDialog(owner) => {
+                                        match crate::save_dialog::choose(owner, &cancel)? {
+                                            Some(path) => SupportDestination::File(path),
+                                            None => return Err(DeviceError::Cancelled),
+                                        }
+                                    }
+                                    destination => destination,
+                                };
+                                let json = crate::device::support::collect(&context, &cancel)?;
+                                cancel.check()?;
+                                worker_stop.check()?;
+                                match destination {
+                                    SupportDestination::Clipboard => Ok(Some(json)),
+                                    SupportDestination::File(path) => {
+                                        crate::device::support::save(&path, &json, &cancel)
+                                            .map(|_| None)
+                                    }
+                                    #[cfg(not(test))]
+                                    SupportDestination::FileDialog(_) => unreachable!(),
+                                }
+                            })();
+                            let _ = results.send(WorkerResult::Support(token, result));
+                        }
                         WorkerCommand::Read(ids, simulated) => {
                             for id in ids {
                                 if worker_stop.check().is_err() {
@@ -3423,6 +3591,9 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             busy: false,
             pending: false,
             pending_discovery: false,
+            support_job: None,
+            support_sequence: 0,
+            support_feedback: None,
             simulated: false,
             refresh_count: 0,
             success_count: 0,
@@ -4089,6 +4260,9 @@ mod tests {
                 busy: false,
                 pending: false,
                 pending_discovery: false,
+                support_job: None,
+                support_sequence: 0,
+                support_feedback: None,
                 simulated: false,
                 refresh_count: 0,
                 success_count: 0,
@@ -4107,6 +4281,92 @@ mod tests {
             },
             results,
         )
+    }
+    #[test]
+    fn support_actions_queue_once_keep_reading_unchanged_and_discard_late_copy() {
+        let mut manager = Manager::default();
+        manager.merge(
+            vec![Candidate {
+                descriptor: crate::device::DeviceDescriptor {
+                    id: "support-device".into(),
+                    physical_id: "local-physical".into(),
+                    endpoint: None,
+                    recoverable: false,
+                    name: "support fixture".into(),
+                    kind: DeviceKind::Mouse,
+                    supported: false,
+                    provider: "unsupported".into(),
+                },
+                reading: Some(
+                    Reading::from_percent(
+                        "support fixture".into(),
+                        35,
+                        crate::device::PowerState::Discharging,
+                    )
+                    .unwrap(),
+                ),
+                error: None,
+            }],
+            100,
+        );
+        let (mut app, _) = headless_app(manager);
+        let (sender, commands) = mpsc::channel();
+        app.sender = sender;
+        let panel = unsafe {
+            CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                560,
+                240,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+        assert!(!panel.is_null());
+        app.panel = panel;
+        app.page = Page::Add;
+        app.request_support("support-device", false);
+        let (token, cancel) = match commands.try_recv().unwrap() {
+            WorkerCommand::Support(token, context, SupportDestination::Clipboard, cancel) => {
+                assert_eq!(context.descriptor.id, "support-device");
+                assert_eq!(context.last_success, Some(100));
+                assert_eq!(context.reading.unwrap().normalized_percent(), 35);
+                (token, cancel)
+            }
+            _ => panic!("wrong worker action"),
+        };
+        assert!(app.busy);
+        app.request_support("support-device", false);
+        assert!(commands.try_recv().is_err());
+        app.complete_support(token + 1, Ok(Some("wrong".into())));
+        assert!(app.effects.support_copies.is_empty());
+        app.complete_support(token, Ok(Some("{\"schema\":1}".into())));
+        assert_eq!(app.effects.support_copies, ["{\"schema\":1}"]);
+        assert_eq!(app.manager.devices[0].last_success, Some(100));
+        assert!(cancel.check().is_ok());
+        app.busy = false;
+        // Cancelling the save picker never queues work or creates an output file.
+        app.request_support("support-device", true);
+        assert!(!app.busy && commands.try_recv().is_err());
+        app.request_support("support-device", false);
+        let (late, cancellation) = match commands.try_recv().unwrap() {
+            WorkerCommand::Support(t, _, _, c) => (t, c),
+            _ => panic!(),
+        };
+        app.cancel_support();
+        assert!(matches!(cancellation.check(), Err(DeviceError::Cancelled)));
+        app.complete_support(late, Ok(Some("late".into())));
+        assert_eq!(app.effects.support_copies.len(), 1);
+        app.panel = null_mut();
+        unsafe {
+            DestroyWindow(panel);
+        }
     }
     #[test]
     fn receive_persists_before_alert_delivery_and_retries_only_valid_results() {
@@ -4657,6 +4917,9 @@ mod tests {
                 busy: false,
                 pending: false,
                 pending_discovery: false,
+                support_job: None,
+                support_sequence: 0,
+                support_feedback: None,
                 simulated: false,
                 refresh_count: 0,
                 success_count: 0,
@@ -4830,10 +5093,22 @@ mod tests {
             hidden_native_bitmap(window, "add-fixture");
             assert_eq!(app.panel, window);
             assert!(app.picker.is_null());
-            assert_eq!(app.rows.len(), 2);
+            assert_eq!(app.rows.len(), 3);
+            for row in &app.rows {
+                assert_eq!(row.extra.len(), 2);
+                assert_eq!(window_text(row.extra[0]), "复制信息");
+                assert_eq!(window_text(row.extra[1]), "导出文件");
+                let bounds = [row.extra[0], row.extra[1], row.refresh].map(|h| {
+                    let mut r = RECT::default();
+                    GetWindowRect(h, &mut r);
+                    r
+                });
+                assert!(bounds[0].right <= bounds[1].left && bounds[1].right <= bounds[2].left);
+                assert!(bounds.iter().all(|r| r.bottom - r.top >= 32));
+            }
             let i = app.rows.iter().position(|r| r.id == "keyboard").unwrap();
-            app.page_command(ADD_BASE + i as u32);
-            assert_eq!(app.rows.len(), 2);
+            app.page_command(ADD_BASE + i as u32 * 3);
+            assert_eq!(app.rows.len(), 3);
             assert_eq!(window_text(app.rows[i].refresh), "已添加");
             assert_eq!(IsWindowEnabled(app.rows[i].refresh), 0);
             app.switch_page(Page::Main);
@@ -4921,6 +5196,9 @@ mod tests {
             busy: true,
             pending: false,
             pending_discovery: true,
+            support_job: None,
+            support_sequence: 0,
+            support_feedback: None,
             simulated: false,
             refresh_count: 0,
             success_count: 0,

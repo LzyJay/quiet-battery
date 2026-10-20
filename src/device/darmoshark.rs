@@ -17,7 +17,7 @@ pub(super) struct DarmosharkAdapter;
 fn number(c: &Collection, key: &str) -> Option<u16> {
     c.fields.get(key)?.value.as_deref()?.parse().ok()
 }
-fn target(c: &Collection) -> bool {
+pub(super) fn target(c: &Collection) -> bool {
     [
         ("vid", 0x248a),
         ("pid", 0xff30),
