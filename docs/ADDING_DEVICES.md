@@ -33,7 +33,7 @@ Registry 是集中入口。新增协议实现 `ProtocolAdapter` 的 `name`、`ow
 
 `discover` 和 `read` 都接收 `Cancellation`；在枚举、槽位和等待循环之间调用 `check()`。返回 `Cancelled` 时丢弃本次未完成扫描，不将半份结果合并为断开状态。单个适配器失败通过 `DiscoveryReport.failures` 独立记录，不中断其他适配器。
 
-可用的协议变化事件通过 Registry 的 change handler 送回通用读数；只能确认状态变化而需要新百分比时，使用 refresh handler 请求串行读取。不得在回调内直接操作 GUI。BAS 已实现这条路径，运行时由查询线程创建 MTA，取消和关闭句柄后才释放。标准 2A19 没有充电字段；仅实际读取成功的标准 2BED 状态允许产生 Charging / Discharging。当前没有 BAS 真机证据，解析夹具与 Windows API 路径实现不能写成型号已测。
+可用的协议变化事件通过 Registry 的 change handler 送回通用读数；只能确认状态变化而需要新百分比时，使用 refresh handler 请求串行读取。不得在回调内直接操作 GUI。BAS 已实现这条路径，运行时由查询线程创建 MTA，取消和关闭句柄后才释放。标准 2A19 没有充电字段；仅实际读取成功的标准 2BED 状态允许产生 Charging / Discharging。基本BAS电量已有广播名BT5.0 KB的真实100%读数和用户反馈；零售型号未确认，变化订阅、可选2BED充电及恢复场景仍待真机验证。解析夹具与Windows API路径实现不能替代这些场景的实测，进度见[任务清单](NEXT-TASKS.md)。
 
 HID“复制信息”只读取后台发现缓存，包括同一物理组内的输入和厂商集合、VID/PID/release、usage、接口、总线、厂商/产品字符串与 Windows 属性。按容器身份分组后才挑选输入候选；鼠标+键盘混合组保守显示 Generic，厂商专用集合不生成默认鼠标。名字和类型的选择不依赖枚举顺序，两个同 VID/PID 容器保持独立。不在 GUI 线程枚举设备；适配器已认领的设备也可在 `--scan` 获取兄弟集合缓存。
 
