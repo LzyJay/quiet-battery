@@ -1,5 +1,7 @@
 # 验证记录
 
+2026-10-20清理核验：GitHub Releases当前仅保留 **v0.2.2（latest）与v0.2.1**，两个版本的EXE、SHA256SUMS和LICENSES附件齐全。已删除v0.2.0的Release及附件，并确认其Git标签仍存在；源码与历史验证记录保留。
+
 ## v0.2.2：用户数据迁移与按需诊断
 
 2026-10-20，Windows 10 x64 / G304，最终EXE为1,482,752字节，CLI及Windows文件/产品版本均为0.2.2。SHA256：`8417adf8a1e4155c6e9467de996a4de5c99ca6bb90aaecd85593cb6193387327`。
@@ -21,7 +23,7 @@
 
 发布成品为1,465,344字节，命令行及Windows文件/产品版本均为0.2.1。SHA256：`1ac6cdc268a2a2b4f4f3ec2e5990cb680048e441bad60c8c2bd939916c954929`。附件仅包含EXE、SHA256SUMS.txt和完整LICENSES.txt；原始设备身份、调查数据和本机缓存不进入发布包。
 
-已发布[正常稳定v0.2.1](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.2.1)并设为latest（非草稿、非预发布）。通过GitHub CLI重新下载三个附件，EXE及两个文本附件均与本地逐一核对SHA256一致；下载版CLI和Windows文件/产品版本均为0.2.1。按用户要求删除0.1.1及0.1.0的Release和附件，现仅保留0.2.1与0.2.0，未删除Git标签或提交历史。
+已发布[正常稳定v0.2.1](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.2.1)并设为latest（非草稿、非预发布）。通过GitHub CLI重新下载三个附件，EXE及两个文本附件均与本地逐一核对SHA256一致；下载版CLI和Windows文件/产品版本均为0.2.1。按用户要求删除0.1.1及0.1.0的Release和附件，当时仅保留0.2.1与0.2.0，未删除Git标签或提交历史。
 
 ## v0.2.1发布前：按钮原生样式闪烁修复
 
