@@ -14,6 +14,8 @@
 - 本机蓝牙诊断走“没有同身份已配对BLE端点”分支；没有据此判断设备不含BAS。新诊断的真实180F/2A19/2BED读取、订阅保留、断开与许可错误尚待真机，已列入任务清单；旧版基本BAS读数不能替代这些验证。
 - EXE为1,609,216字节，CLI及Windows文件/产品资源版本0.3.1。SHA256：`7aff31539995c956c05022ea253779c20979455ebf33b7f65d3d8ded26ec6240`。原始导出、剪贴板、实际截图、短采样与运行记录仅留被忽略的validation目录。
 
+- 已通过GitHub CLI发布正式[v0.3.1](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.3.1)并设为latest。下载回的EXE、SHA256SUMS和LICENSES三份附件逐一哈希一致，CLI及Windows文件/产品资源均为0.3.1。保留v0.3.0、v0.2.3和v0.2.2，未删除旧Release或附件。
+
 ## v0.3.0：第一批常见型号协议适配
 
 2026-10-20，Windows10 x64。本次新增型号没有实体硬件；协议、模拟事务、原生传输与可用G304回归分开记录。[设备支持表](DEVICE-SUPPORT.md)列出精确ID、来源版本、协议字段与全部未测边界。
