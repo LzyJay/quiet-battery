@@ -3,6 +3,7 @@
 mod app;
 mod device;
 mod icons;
+mod launch;
 mod licenses;
 mod manager;
 mod notifications;
@@ -135,15 +136,19 @@ fn main() {
         Some("--startup-status") => print_startup(),
         Some("--help" | "-h") => {
             output(
-                "Quiet Battery\n默认启动原生托盘；--diagnose 被动 HID 元数据（可选 --include-identifiers 导出本机标识）；--scan 发现并查询电量；--probe <id> 查询指定设备；--once 读取一次；--status 当前托盘快照；--refresh 刷新；--quit 退出；--show 打开主窗口；--hide-panel 关闭主窗口；--show-menu 打开真实托盘菜单；--startup-status / --startup-enable / --startup-disable 管理当前用户登录启动。\n隔离通知自测：--test-notification。测试钩子：--simulate-device-error / --simulate-recovery / --simulate-explorer-restart。",
+                "Quiet Battery\n默认打开主窗口并运行托盘；--background 仅后台托盘（登录自启使用）；--diagnose 被动 HID 元数据（可选 --include-identifiers 导出本机标识）；--scan 发现并查询电量；--probe <id> 查询指定设备；--once 读取一次；--status 当前托盘快照；--refresh 刷新；--quit 退出；--show 打开主窗口；--hide-panel 关闭主窗口；--show-menu 打开真实托盘菜单；--startup-status / --startup-enable / --startup-disable 管理当前用户登录启动。\n隔离通知自测：--test-notification。测试钩子：--simulate-device-error / --simulate-recovery / --simulate-explorer-restart。",
             );
             Ok(())
         }
+        Some("--background") => app::run(launch::Mode::Background),
         Some(other) => Err(format!("未知参数: {other}")),
-        None => app::run(),
+        None => app::run(launch::Mode::Window),
     };
     if let Err(error) = result {
         output(&format!("{{\"error\":{}}}", app::json_string(&error)));
+        if launch::Mode::from_argument(argument.as_deref()).is_some() {
+            launch::show_error(&error);
+        }
         std::process::exit(1);
     }
 }
@@ -151,7 +156,7 @@ fn main() {
 fn print_startup() -> Result<(), String> {
     let state = startup::status()?;
     output(&format!(
-        "{{\"exists\":{},\"enabled\":{},\"target\":{},\"shortcut\":{}}}",
+        "{{\"exists\":{},\"enabled\":{},\"target\":{},\"shortcut\":{},\"arguments\":{}}}",
         state.exists,
         state.enabled,
         state
@@ -159,7 +164,12 @@ fn print_startup() -> Result<(), String> {
             .as_deref()
             .map(app::json_string)
             .unwrap_or_else(|| "null".into()),
-        app::json_string(&state.path.to_string_lossy())
+        app::json_string(&state.path.to_string_lossy()),
+        state
+            .arguments
+            .as_deref()
+            .map(app::json_string)
+            .unwrap_or_else(|| "null".into())
     ));
     Ok(())
 }

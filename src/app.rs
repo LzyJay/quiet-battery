@@ -1660,6 +1660,10 @@ impl App {
                     null(),
                 );
                 if self.panel.is_null() {
+                    crate::launch::show_error(&format!(
+                        "无法创建主窗口（Windows错误{}）",
+                        GetLastError()
+                    ));
                     return;
                 }
                 attach_bridge(self.panel, &self.bridge);
@@ -3224,7 +3228,7 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
         RestoreDC(dc, saved);
     }
 }
-pub fn run() -> Result<(), String> {
+pub fn run(mode: crate::launch::Mode) -> Result<(), String> {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let mutex = CreateMutexW(
@@ -3240,24 +3244,39 @@ pub fn run() -> Result<(), String> {
             for _ in 0..20 {
                 let hwnd = find_window();
                 if !hwnd.is_null() {
-                    PostMessageW(hwnd, CONTROL, REFRESH, 0);
+                    if PostMessageW(hwnd, CONTROL, mode.existing_command(), 0) == 0 {
+                        return Err("无法通知已有实例打开窗口".into());
+                    }
                     return Ok(());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             return Err("已有实例正在启动".into());
         }
-        let result = run_owned();
+        let result = run_owned(mode);
         ReleaseMutex(mutex);
         CloseHandle(mutex);
         result
     }
 }
-unsafe fn run_owned() -> Result<(), String> {
+unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
     // Keep the STA alive until after every native window and the message loop.
     // Last CoUninitialize may discard non-COM messages during its cleanup pump.
     let _com = startup::Com::init()?;
     crate::storage::initialize()?;
+    if let Err(error) = startup::upgrade_background() {
+        unsafe {
+            MessageBoxW(
+                null_mut(),
+                wide(&format!(
+                    "{error}\n\n软件将继续启动。请在设置中重新设置登录启动。"
+                ))
+                .as_ptr(),
+                wide("登录启动设置更新失败").as_ptr(),
+                MB_OK | MB_ICONWARNING,
+            );
+        }
+    }
     unsafe {
         let instance = GetModuleHandleW(null());
         let init = INITCOMMONCONTROLSEX {
@@ -3445,6 +3464,9 @@ unsafe fn run_owned() -> Result<(), String> {
         }
         app.update_icons(false);
         app.discover();
+        if mode.show_window() {
+            app.show_panel();
+        }
         let mut message: MSG = std::mem::zeroed();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
             input_focus_cues(app.panel, &message);

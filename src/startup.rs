@@ -167,19 +167,16 @@ pub struct StartupStatus {
     pub exists: bool,
     pub enabled: bool,
     pub target: Option<String>,
+    pub arguments: Option<String>,
     pub path: PathBuf,
 }
-pub fn status() -> Result<StartupStatus, String> {
-    let _com = Com::init()?;
-    let path = shortcut_path()?;
-    if !path.exists() {
-        return Ok(StartupStatus {
-            exists: false,
-            enabled: false,
-            target: None,
-            path,
-        });
-    }
+struct LoadedLink {
+    shell: Interface,
+    persist: Interface,
+    target: String,
+    arguments: String,
+}
+fn load_link(path: &std::path::Path) -> Result<LoadedLink, String> {
     let shell = link()?;
     let persist = shell.persist()?;
     let load: unsafe extern "system" fn(*mut c_void, *const u16, u32) -> i32 =
@@ -204,20 +201,94 @@ pub fn status() -> Result<StartupStatus, String> {
     let get_args: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> i32 =
         unsafe { shell.method(10) };
     check(unsafe { get_args(shell.0, args.as_mut_ptr(), args.len() as i32) })?;
-    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    let enabled = PathBuf::from(&target)
+    let arguments =
+        String::from_utf16_lossy(&args[..args.iter().position(|&c| c == 0).unwrap_or(args.len())]);
+    Ok(LoadedLink {
+        shell,
+        persist,
+        target,
+        arguments,
+    })
+}
+fn save_link(persist: &Interface, path: &std::path::Path) -> Result<(), String> {
+    let save: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> i32 =
+        unsafe { persist.method(6) };
+    check(unsafe { save(persist.0, wide(&path.to_string_lossy()).as_ptr(), 1) })
+}
+fn same_target(target: &str, executable: &std::path::Path) -> bool {
+    PathBuf::from(target)
         .canonicalize()
         .ok()
         .zip(executable.canonicalize().ok())
         .is_some_and(|(target, executable)| target == executable)
-        && args[0] == 0
+}
+fn background_arguments(arguments: &str) -> bool {
+    arguments.is_empty() || arguments == "--background"
+}
+pub fn status() -> Result<StartupStatus, String> {
+    let _com = Com::init()?;
+    let path = shortcut_path()?;
+    if !path.exists() {
+        return Ok(StartupStatus {
+            exists: false,
+            enabled: false,
+            target: None,
+            arguments: None,
+            path,
+        });
+    }
+    let info = load_link(&path)?;
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let enabled = same_target(&info.target, &executable)
+        && background_arguments(&info.arguments)
         && approved()?;
     Ok(StartupStatus {
         exists: true,
         enabled,
-        target: Some(target),
+        target: Some(info.target),
+        arguments: Some(info.arguments),
         path,
     })
+}
+fn write_link(
+    path: &std::path::Path,
+    executable: &std::path::Path,
+    arguments: &str,
+) -> Result<(), String> {
+    let shell = link()?;
+    shell.set(20, &executable.to_string_lossy())?;
+    shell.set(
+        9,
+        &executable
+            .parent()
+            .ok_or("EXE路径没有父目录")?
+            .to_string_lossy(),
+    )?;
+    shell.set(11, arguments)?;
+    shell.set(7, "Quiet Battery · 外设电量")?;
+    save_link(&shell.persist()?, path)
+}
+fn upgrade_at(path: &std::path::Path, executable: &std::path::Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let info = load_link(path)?;
+    if !same_target(&info.target, executable) || !info.arguments.is_empty() {
+        return Ok(false);
+    }
+    info.shell.set(11, "--background")?;
+    save_link(&info.persist, path)?;
+    Ok(true)
+}
+/// Update only our legacy blank-argument shortcut. Never create/enable a startup
+/// entry, change its target, or clear Windows StartupApproved on an upgrade.
+pub fn upgrade_background() -> Result<(), String> {
+    let _com = Com::init()?;
+    upgrade_at(
+        &shortcut_path()?,
+        &std::env::current_exe().map_err(|e| e.to_string())?,
+    )
+    .map(|_| ())
 }
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
     let _com = Com::init()?;
@@ -228,15 +299,47 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
         }
         return Ok(());
     }
-    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    let shell = link()?;
-    shell.set(20, &executable.to_string_lossy())?;
-    shell.set(9, &executable.parent().unwrap().to_string_lossy())?;
-    shell.set(11, "")?;
-    shell.set(7, "Quiet Battery · 外设电量")?;
-    let persist = shell.persist()?;
-    let save: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> i32 =
-        unsafe { persist.method(6) };
-    check(unsafe { save(persist.0, wide(&path.to_string_lossy()).as_ptr(), 1) })?;
+    write_link(
+        &path,
+        &std::env::current_exe().map_err(|e| e.to_string())?,
+        "--background",
+    )?;
     clear_explicit_disable()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn legacy_shortcut_upgrades_once_without_retargeting_or_creating_entries() {
+        let _com = Com::init().unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".build/tmp/launch-shortcut-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Quiet Battery.lnk");
+        let executable = std::env::current_exe().unwrap();
+        assert!(!upgrade_at(&path, &executable).unwrap());
+        assert!(!path.exists());
+        write_link(&path, &executable, "").unwrap();
+        assert!(background_arguments(&load_link(&path).unwrap().arguments));
+        assert!(upgrade_at(&path, &executable).unwrap());
+        let info = load_link(&path).unwrap();
+        assert_eq!(info.arguments, "--background");
+        assert!(same_target(&info.target, &executable));
+        drop(info);
+        assert!(!upgrade_at(&path, &executable).unwrap());
+        write_link(&path, &executable, "--status").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(!upgrade_at(&path, &executable).unwrap());
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        assert!(!background_arguments("--status"));
+        let other = root.join("other.exe");
+        std::fs::write(&other, b"test fixture").unwrap();
+        write_link(&path, &other, "").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(!upgrade_at(&path, &executable).unwrap());
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(other).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 }

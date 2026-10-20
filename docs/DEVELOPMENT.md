@@ -16,6 +16,12 @@ Windows x64、Rust stable、MSVC工具链与Windows SDK。当前验证工具链�
 
 图标已提交，普通构建不需要Python。修改图标后用Python/Pillow执行 `tools/generate_assets.py`，同时核对原生显示。升级依赖或Rust后执行 `python tools/update_notices.py`；需要对应rust-docs，或同一编译器的已提交声明。
 
+## 启动行为
+
+无参数运行立即显示主窗口；再次运行恢复现有实例的窗口，不创建第二个常驻进程。`--background` 仅启动托盘，供登录自启或后台验证使用。自启快捷方式使用该参数；升级时只更新目标确为当前EXE、原参数为空的旧快捷方式，不创建新启动项、不更换目标、不清除Windows禁用状态，不改其他自定义参数。缺失或已禁用的自启不会被恢复。
+
+正常启动失败显示原生错误弹窗和处理建议；CLI诊断失败仍仅输出JSON并返回非零退出码，不让脚本卡在弹窗。原生弹窗测试使用隔离桌面子进程，不切换用户输入桌面。快捷方式参数升级失败会提示，主程序继续启动；没有新增错误日志文件。
+
 ## 诊断
 
 GUI子系统EXE应等待退出并捕获UTF-8输出；设备ID用参数列表传递，不拼接未经转义的Shell命令。
@@ -75,6 +81,6 @@ Input / Output / Feature 长度来自零访问权限句柄的 `HidD_GetPreparsed
 
 1. 核对代码、支持范围、许可、截图；执行完整构建及必要真机检查。
 2. 从 `dist/quiet-battery.exe` 复制成品为 `quiet-battery-windows-x64.exe`，生成SHA256与简明说明。
-3. v0.2.2 使用正常稳定 Release（不标 prerelease），标为 latest；说明G304、N3和标准蓝牙BAS的实际验证范围及未测场景，FL980保持搁置、未支持。发布后重新下载成品，核对 SHA256、`--version` 与 Windows 文件/产品资源版本。
+3. 正常版本使用稳定 Release（不标 prerelease），标为 latest；说明G304、N3和标准蓝牙BAS的实际验证范围及未测场景，FL980保持搁置、未支持。发布后重新下载成品，核对 SHA256、`--version` 与 Windows 文件/产品资源版本。
 4. GitHub Releases仅保留按发布时间排序的最新2个已发布版本。确认新版EXE和附件下载核验通过，且保留的两个版本附件齐全后，再删除更旧的Release及其附件；不删除Git标签或提交历史，不使用 `--cleanup-tag`。同步更新验证记录；历史发布记录使用“当时”表述，避免误认成当前版本列表。
 5. 不上传缓存、本地data、原始validation、旧设计和机器身份。许可与第三方声明已编入EXE，也可附文本供查阅。

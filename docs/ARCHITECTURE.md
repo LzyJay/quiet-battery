@@ -25,7 +25,7 @@
 - `src/notifications.rs`：品牌无关的提醒周期与Windows提交。新有效读数推进周期，保存成功后投递；失败保留待投递项。
 - `src/app.rs`：主线程消息循环、三页控件、后台任务/结果桥、Shell菜单。同步回调也显式唤醒循环。
 - `src/icons.rs`：按类型和电量生成当前HICON，主窗口与托盘使用同源填色几何。
-- `src/startup.rs`：真实自启与快捷方式；`src/licenses.rs`：单EXE许可文本。
+- `src/launch.rs`：前台/后台启动模式及可见启动错误，CLI保持JSON错误；`src/startup.rs`：真实自启与后台参数快捷方式，兼容升级旧参数且不改禁用状态；`src/licenses.rs`：单EXE许可文本。
 
 ## 状态与调度
 
