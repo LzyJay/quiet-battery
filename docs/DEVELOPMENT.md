@@ -29,6 +29,10 @@ GUI子系统EXE应等待退出并捕获UTF-8输出；设备ID用参数列表传�
 | `--test-notification` | 隔离的原生通知自测，不改电量和提醒周期 |
 | `--version` / `--licenses` | 版本与二进制内的完整许可 |
 
+设置仅保存至 `%LOCALAPPDATA%\QuietBattery`；正常启动不在EXE目录创建文件。旧版 `data/devices-v2.state` 自动迁移，开发目录旧 `.build/devices-v2.state` 也能迁移；新设置已存在时不覆盖。只清理确认一致的旧状态、旧运行快照及空 `data` 目录，失败保留原文件。测试夹具使用 `.build/tmp`，不得在测试中改真实LocalAppData设置。
+
+`--status` 从正在运行的同会话托盘按需取得JSON，不再读取或周期性写入 `runtime-status.json`，原有JSON字段保持兼容；未运行、旧版本不支持IPC或超时返回错误，不取过期文件充数。需要文件时由调用方明确重定向保存；截图与采样工具也通过该接口查询。`--diagnose` 本身仍只输出标准输出，只有显式运行导出工具才落盘。
+
 `--simulate-device-error`、`--simulate-recovery`、`--simulate-explorer-restart`是验证钩子，不是物理休眠、拔插或系统重启证据。公开截图不附原始状态文件与身份。
 
 界面复制读取最近一次成功后台发现的诊断缓存；`--scan` 先运行一次发现，再序列化该次成功更新的缓存，发现失败时可能保留此前缓存。它们不保证每次复制/序列化都重新读取端点。需要当前机器的新证据时单独执行被动 `--diagnose`。
@@ -71,6 +75,6 @@ Input / Output / Feature 长度来自零访问权限句柄的 `HidD_GetPreparsed
 
 1. 核对代码、支持范围、许可、截图；执行完整构建及必要真机检查。
 2. 从 `dist/quiet-battery.exe` 复制成品为 `quiet-battery-windows-x64.exe`，生成SHA256与简明说明。
-3. v0.2.1 使用正常稳定 Release（不标 prerelease），标为 latest；说明G304、N3和标准蓝牙BAS的实际验证范围及未测场景，FL980保持搁置、未支持。发布后重新下载成品，核对 SHA256、`--version` 与 Windows 文件/产品资源版本。
+3. v0.2.2 使用正常稳定 Release（不标 prerelease），标为 latest；说明G304、N3和标准蓝牙BAS的实际验证范围及未测场景，FL980保持搁置、未支持。发布后重新下载成品，核对 SHA256、`--version` 与 Windows 文件/产品资源版本。
 4. GitHub Releases仅保留最新2个；确认新版本成品核验通过后删除更旧的Release及其附件，保留Git标签，除非用户另有要求。
 5. 不上传缓存、本地data、原始validation、旧设计和机器身份。许可与第三方声明已编入EXE，也可附文本供查阅。

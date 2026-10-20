@@ -1,7 +1,7 @@
 """Capture pixels of this app's real running Win32 window, never a mockup.
 
 Build/verification utility only (Python + Pillow are not runtime dependencies).
-Captures only windows belonging to the PID in this project's runtime snapshot.
+Captures only windows belonging to the PID returned by this project's on-demand status query.
 """
 from pathlib import Path
 from datetime import datetime, timezone
@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import time
+import subprocess
 from PIL import ImageGrab
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -37,7 +38,10 @@ user.WindowFromPoint.argtypes=[w.POINT]
 user.WindowFromPoint.restype=w.HWND
 user.GetAncestor.argtypes=[w.HWND,w.UINT]
 user.GetAncestor.restype=w.HWND
-state=json.loads((ROOT/'.build/runtime-status.json').read_text(encoding='utf-8'))
+def query_status():
+ result=subprocess.run([str(ROOT/'dist/quiet-battery.exe'),'--status'],capture_output=True,encoding='utf-8',timeout=6,check=True)
+ return json.loads(result.stdout)
+state=query_status()
 if not 0 <= time.time()-state['updated_unix'] <= 60:
  raise RuntimeError('Runtime snapshot is stale')
 # Bind evidence to the running process image, not merely a file at dist/.
@@ -121,7 +125,7 @@ if args.screen:
 else:
  points_before=points_after=[]
  pixels=ImageGrab.grab(window=hwnd)
-after=json.loads((ROOT/'.build/runtime-status.json').read_text(encoding='utf-8'))
+after=query_status()
 if after['pid']!=state['pid']:raise RuntimeError('Tray process changed during capture')
 if pixels.getextrema()==((0,0),(0,0),(0,0)):raise RuntimeError('Windows returned an all-black capture')
 args.output.parent.mkdir(parents=True,exist_ok=True)

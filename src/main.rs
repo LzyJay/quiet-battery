@@ -7,6 +7,8 @@ mod licenses;
 mod manager;
 mod notifications;
 mod startup;
+mod status_ipc;
+mod storage;
 
 use device::Registry;
 use std::io::Write;

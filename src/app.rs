@@ -118,6 +118,7 @@ struct UiBridge {
     activity_needed: Cell<bool>,
     activity_seen: Cell<Instant>,
     notification_events: Cell<[u64; 3]>,
+    status: RefCell<StatusView>,
 }
 #[derive(Clone, Copy, Default)]
 struct MenuTiming {
@@ -233,7 +234,6 @@ struct App {
     bridge: Rc<UiBridge>,
     panel_fonts: [HFONT; 3],
     panel_icons: [HICON; 2],
-    snapshot_error: Option<String>,
     last_activity_refresh: Instant,
     picker_ids: Vec<String>,
     page: Page,
@@ -297,30 +297,7 @@ pub fn reading_json(reading: &Reading) -> String {
     )
 }
 pub fn data_directory() -> PathBuf {
-    let executable = std::env::current_exe().unwrap_or_default();
-    let directory = executable
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    if cfg!(test) {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".build/tmp")
-    } else if directory.file_name().is_some_and(|n| n == "dist") {
-        directory.parent().unwrap().join(".build")
-    } else if directory
-        .parent()
-        .and_then(|p| p.file_name())
-        .is_some_and(|n| n == "target")
-    {
-        directory.parent().unwrap().parent().unwrap().to_path_buf()
-    } else {
-        directory.join("data")
-    }
-}
-fn status_path() -> PathBuf {
-    data_directory().join(if cfg!(test) {
-        format!("runtime-test-{:?}.json", std::thread::current().id())
-    } else {
-        "runtime-status.json".into()
-    })
+    crate::storage::directory()
 }
 
 fn find_window() -> HWND {
@@ -342,44 +319,15 @@ pub fn print_status() -> Result<(), String> {
     if window.is_null() {
         return Err("托盘未运行".into());
     }
-    let value = std::fs::read_to_string(status_path()).map_err(|e| e.to_string())?;
-    let mut owner = 0;
-    unsafe {
-        GetWindowThreadProcessId(window, &mut owner);
-    }
-    validate_snapshot(&value, owner, now())?;
-    crate::output(&value);
+    crate::output(&crate::status_ipc::query(window)?);
     Ok(())
 }
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-fn validate_snapshot(value: &str, owner: u32, timestamp: u64) -> Result<(), String> {
-    if !value.starts_with(&format!("{{\"pid\":{owner},")) {
-        return Err("状态快照尚未就绪或属于旧进程".into());
-    }
-    let updated = value
-        .split("\"updated_unix\":")
-        .nth(1)
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.parse::<u64>().ok());
-    if !updated
-        .is_some_and(|t| t <= timestamp.saturating_add(5) && timestamp.saturating_sub(t) <= 60)
-    {
-        return Err("状态快照已过期，托盘可能未能写入新的状态".into());
-    }
-    Ok(())
-}
-fn write_snapshot(path: &std::path::Path, value: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, value).map_err(|e| e.to_string())?;
-    replace_file(&temporary, path)
 }
 pub fn replace_file(temporary: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
     if unsafe {
@@ -440,8 +388,23 @@ pub fn descriptor_json(candidate: &Candidate) -> String {
         Registry::diagnostic_information(&candidate.descriptor).unwrap_or_else(|| "null".into())
     )
 }
-impl App {
-    fn snapshot(&mut self) {
+#[derive(Default)]
+struct StatusView {
+    manager: Manager,
+    busy: bool,
+    simulated: bool,
+    refresh_count: u64,
+    success_count: u64,
+    tray_registered: bool,
+    panel: HWND,
+    fallback_tray_id: Option<u32>,
+    tray_ids: Vec<(String, u32)>,
+    page: Page,
+    notification_submissions: u64,
+    notification_last_accepted: bool,
+}
+impl StatusView {
+    fn json(&self, menu: MenuTiming, counts: [u64; 3]) -> String {
         let first = self.manager.selected().next();
         let reading = first.and_then(|s| s.reading.as_ref());
         let last = first.and_then(|s| s.last_success);
@@ -449,8 +412,7 @@ impl App {
         let stale = first.is_none_or(|s| {
             s.error.is_some() || s.last_success.is_none_or(|t| now().saturating_sub(t) > 240)
         });
-        let menu = self.bridge.menu_timing.get();
-        let devices=self.manager.devices.iter().map(|s|format!("{{\"id\":{},\"name\":{},\"kind\":{},\"supported\":{},\"selected\":{},\"removed\":{},\"show_tray\":{},\"tray_id\":{},\"connected\":{},\"last_success_unix\":{},\"reading\":{},\"error\":{}}}",json_string(&s.descriptor.id),json_string(&s.descriptor.name),json_string(s.descriptor.kind.key()),s.descriptor.supported,s.selected,s.removed,s.show_tray,self.trays.iter().find(|t|t.id==s.descriptor.id).map_or_else(||"null".into(),|t|t.shell_id.to_string()),s.connected,opt_number(s.last_success),s.reading.as_ref().map_or_else(||"null".into(),reading_json),s.error.as_ref().map_or_else(||"null".into(),|e|json_string(&e.to_string())))).collect::<Vec<_>>().join(",");
+        let devices=self.manager.devices.iter().map(|s|format!("{{\"id\":{},\"name\":{},\"kind\":{},\"supported\":{},\"selected\":{},\"removed\":{},\"show_tray\":{},\"tray_id\":{},\"connected\":{},\"last_success_unix\":{},\"reading\":{},\"error\":{}}}",json_string(&s.descriptor.id),json_string(&s.descriptor.name),json_string(s.descriptor.kind.key()),s.descriptor.supported,s.selected,s.removed,s.show_tray,self.tray_ids.iter().find(|(id,_)|*id==s.descriptor.id).map_or_else(||"null".into(),|(_,id)|id.to_string()),s.connected,opt_number(s.last_success),s.reading.as_ref().map_or_else(||"null".into(),reading_json),s.error.as_ref().map_or_else(||"null".into(),|e|json_string(&e.to_string())))).collect::<Vec<_>>().join(",");
         let startup = startup::status();
         let enabled = startup.as_ref().is_ok_and(|s| s.enabled);
         let value = format!(
@@ -463,8 +425,7 @@ impl App {
             self.simulated,
             self.refresh_count,
             self.success_count,
-            self.trays.iter().all(|t| t.registered)
-                && self.fallback.as_ref().is_none_or(|t| t.registered),
+            self.tray_registered,
             !self.panel.is_null(),
             !self.panel.is_null() && unsafe { IsWindowVisible(self.panel) } != 0,
             enabled,
@@ -474,9 +435,8 @@ impl App {
                 .persistence_error
                 .as_ref()
                 .map_or_else(|| "null".into(), |e| json_string(e)),
-            self.fallback
-                .as_ref()
-                .map_or_else(|| "null".into(), |t| t.shell_id.to_string()),
+            self.fallback_tray_id
+                .map_or_else(|| "null".into(), |id| id.to_string()),
             devices,
             self.manager
                 .discovery_errors
@@ -503,11 +463,10 @@ impl App {
                 )
             },
         );
-        let counts = self.bridge.notification_events.get();
-        let value=value.strip_suffix('}').map_or_else(||value.clone(),|v|format!("{v},\"notification\":{{\"submissions\":{},\"last_accepted\":{},\"shown\":{},\"hidden\":{},\"timed_out\":{}}}}}",self.notification_submissions,self.notification_last_accepted,counts[0],counts[1],counts[2]));
-        self.snapshot_error = write_snapshot(&status_path(), &value).err();
-        self.publish_view();
+        value.strip_suffix('}').map_or_else(||value.clone(),|v|format!("{v},\"notification\":{{\"submissions\":{},\"last_accepted\":{},\"shown\":{},\"hidden\":{},\"timed_out\":{}}}}}",self.notification_submissions,self.notification_last_accepted,counts[0],counts[1],counts[2]))
     }
+}
+impl App {
     fn persist(&mut self) {
         #[cfg(test)]
         let path = self
@@ -520,6 +479,26 @@ impl App {
         self.manager.save(&path);
     }
     fn publish_view(&self) {
+        *self.bridge.status.borrow_mut() = StatusView {
+            manager: self.manager.clone(),
+            busy: self.busy,
+            simulated: self.simulated,
+            refresh_count: self.refresh_count,
+            success_count: self.success_count,
+            tray_registered: self.trays.iter().all(|t| t.registered)
+                && self.fallback.as_ref().is_none_or(|t| t.registered),
+            panel: self.panel,
+            fallback_tray_id: self.fallback.as_ref().map(|t| t.shell_id),
+            tray_ids: self
+                .trays
+                .iter()
+                .map(|t| (t.id.clone(), t.shell_id))
+                .collect(),
+            page: self.page,
+            notification_submissions: self.notification_submissions,
+            notification_last_accepted: self.notification_last_accepted,
+        };
+
         self.bridge.activity_needed.set(
             (self.manager.selected().next().is_none()
                 && self
@@ -617,7 +596,7 @@ impl App {
         {
             self.busy = false;
         }
-        self.snapshot();
+        self.publish_view();
     }
     fn discover(&mut self) {
         if self.busy {
@@ -632,7 +611,7 @@ impl App {
         {
             self.busy = false;
         }
-        self.snapshot();
+        self.publish_view();
     }
     fn receive(&mut self) {
         if self.stop.check().is_err() {
@@ -726,7 +705,7 @@ impl App {
             } else {
                 self.prune_alerts();
             }
-            self.snapshot();
+            self.publish_view();
         }
     }
     fn prune_alerts(&mut self) {
@@ -1045,7 +1024,7 @@ impl App {
                 }
                 _ => {}
             }
-            self.snapshot();
+            self.publish_view();
         }
     }
     fn set_startup(&mut self, desired: bool) {
@@ -1059,7 +1038,7 @@ impl App {
                 );
             }
         }
-        self.snapshot();
+        self.publish_view();
     }
     fn page_states(&self) -> Vec<DeviceState> {
         match self.page {
@@ -1655,7 +1634,7 @@ impl App {
                 }
             }
         }
-        self.snapshot();
+        self.publish_view();
     }
     fn show_panel(&mut self) {
         unsafe {
@@ -1695,7 +1674,7 @@ impl App {
                 SetForegroundWindow(self.panel);
             }
         }
-        self.snapshot();
+        self.publish_view();
     }
     fn release_panel_resources(&mut self) {
         unsafe {
@@ -1724,7 +1703,7 @@ impl App {
             }
         }
         self.release_panel_resources();
-        self.snapshot();
+        self.publish_view();
     }
     fn show_picker(&mut self) {
         if self.panel.is_null() {
@@ -1860,7 +1839,7 @@ impl App {
             self.operation_error(&format!("无法保存设置：{error}"));
         }
         self.sync_preferences();
-        self.snapshot();
+        self.publish_view();
     }
     fn sync_preferences(&self) {
         if self.panel.is_null() || self.page != Page::Settings {
@@ -2062,7 +2041,7 @@ impl App {
                             self.notification_last_accepted =
                                 crate::notifications::show(self.hwnd, entry.shell_id, "", 0, true);
                             self.notification_submissions += 1;
-                            self.snapshot();
+                            self.publish_view();
                         }
                     }
                     value if value == ADD as usize => self.show_picker(),
@@ -2076,7 +2055,7 @@ impl App {
                         self.persist();
                         self.deliver_alerts();
                     }
-                    self.snapshot();
+                    self.publish_view();
                 }
                 UiEvent::Refresh => self.refresh(),
                 UiEvent::Discover => self.discover(),
@@ -2134,7 +2113,7 @@ impl App {
                         self.release_panel_resources();
                     }
                 }
-                UiEvent::ActivatePanel => self.snapshot(),
+                UiEvent::ActivatePanel => self.publish_view(),
                 UiEvent::DpiChanged(hwnd, bounds) => {
                     if self.picker == hwnd {
                         unsafe {
@@ -2168,7 +2147,7 @@ impl App {
                 UiEvent::SettingsChanged => {
                     self.update_icons(true);
                     self.retheme_rows();
-                    self.snapshot();
+                    self.publish_view();
                 }
                 UiEvent::TaskbarCreated => {
                     for entry in &mut self.trays {
@@ -2178,7 +2157,7 @@ impl App {
                         entry.registered = false;
                     }
                     self.update_icons(true);
-                    self.snapshot();
+                    self.publish_view();
                 }
             }
         }
@@ -2817,6 +2796,17 @@ unsafe extern "system" fn window_proc(
     let Some(bridge) = (unsafe { callback_bridge(hwnd) }) else {
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
+    if message == crate::status_ipc::REQUEST {
+        let client = lparam as HWND;
+        if crate::status_ipc::valid_client(client, wparam as u32) {
+            let value = bridge
+                .status
+                .borrow()
+                .json(bridge.menu_timing.get(), bridge.notification_events.get());
+            crate::status_ipc::respond(client, hwnd, &value);
+        }
+        return 0;
+    }
     if message == EVENTS_READY {
         return 0;
     }
@@ -3267,6 +3257,7 @@ unsafe fn run_owned() -> Result<(), String> {
     // Keep the STA alive until after every native window and the message loop.
     // Last CoUninitialize may discard non-COM messages during its cleanup pump.
     let _com = startup::Com::init()?;
+    crate::storage::initialize()?;
     unsafe {
         let instance = GetModuleHandleW(null());
         let init = INITCOMMONCONTROLSEX {
@@ -3393,6 +3384,7 @@ unsafe fn run_owned() -> Result<(), String> {
             activity_needed: Cell::new(true),
             activity_seen: Cell::new(Instant::now() - std::time::Duration::from_secs(30)),
             notification_events: Cell::new([0; 3]),
+            status: RefCell::new(StatusView::default()),
         });
         attach_bridge(hwnd, &bridge);
         let mut app = App {
@@ -3418,7 +3410,6 @@ unsafe fn run_owned() -> Result<(), String> {
             bridge: bridge.clone(),
             panel_fonts: [null_mut(); 3],
             panel_icons: [null_mut(); 2],
-            snapshot_error: None,
             last_activity_refresh: Instant::now() - std::time::Duration::from_secs(10),
             picker_ids: Vec::new(),
             page: Page::Main,
@@ -3528,7 +3519,6 @@ unsafe fn run_owned() -> Result<(), String> {
         if let Some(worker) = app.worker.take() {
             let _ = worker.join();
         }
-        let _ = std::fs::remove_file(status_path());
         for name in [CLASS, PANEL_CLASS] {
             UnregisterClassW(wide(name).as_ptr(), instance);
         }
@@ -4083,7 +4073,6 @@ mod tests {
                 bridge: test_bridge(),
                 panel_fonts: [null_mut(); 3],
                 panel_icons: [null_mut(); 2],
-                snapshot_error: None,
                 last_activity_refresh: Instant::now(),
                 picker_ids: Vec::new(),
                 page: Page::Main,
@@ -4241,7 +4230,6 @@ mod tests {
             std::fs::remove_file(path).unwrap();
         }
         std::fs::remove_dir(root).unwrap();
-        let _ = std::fs::remove_file(status_path());
     }
     fn test_bridge() -> Rc<UiBridge> {
         Rc::new(UiBridge {
@@ -4256,6 +4244,7 @@ mod tests {
             activity_needed: Cell::new(true),
             activity_seen: Cell::new(Instant::now() - std::time::Duration::from_secs(30)),
             notification_events: Cell::new([0; 3]),
+            status: RefCell::new(StatusView::default()),
         })
     }
     #[test]
@@ -4494,19 +4483,30 @@ mod tests {
         assert_eq!(cell_fill(None, 0), 0);
     }
     #[test]
-    fn snapshot_checks_owner_age_and_atomic_replace() {
-        assert!(
-            validate_snapshot("{\"pid\":42,\"updated_unix\":100,\"busy\":false}", 42, 160).is_ok()
+    fn status_is_serialized_on_demand_without_files() {
+        let view = StatusView {
+            manager: Manager {
+                threshold: 37,
+                notifications_enabled: false,
+                ..Manager::default()
+            },
+            ..StatusView::default()
+        };
+        let text = view.json(
+            MenuTiming {
+                count: 3,
+                visible_idle_us: Some(7400),
+                ..MenuTiming::default()
+            },
+            [1, 2, 3],
         );
-        assert!(
-            validate_snapshot("{\"pid\":42,\"updated_unix\":100,\"busy\":false}", 41, 100).is_err()
-        );
-        let path = data_directory().join(format!("atomic-native-{}.json", std::process::id()));
-        write_snapshot(&path, "first").unwrap();
-        write_snapshot(&path, "second").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
-        std::fs::remove_file(path).unwrap();
+        assert!(text.starts_with(&format!("{{\"pid\":{},", std::process::id())));
+        assert!(text.contains("\"threshold\":37"));
+        assert!(text.contains("\"notifications_enabled\":false"));
+        assert!(text.contains("\"visible_idle_us\":7400"));
+        assert!(text.contains("\"shown\":1"));
     }
+
     #[test]
     fn activity_wakes_after_idle_coalesces_bursts_and_bounds_error_retries() {
         let bridge = test_bridge();
@@ -4641,7 +4641,6 @@ mod tests {
                 bridge: test_bridge(),
                 panel_fonts: [null_mut(); 3],
                 panel_icons: [null_mut(); 2],
-                snapshot_error: None,
                 last_activity_refresh: Instant::now(),
                 picker_ids: Vec::new(),
                 page: Page::Main,
@@ -4850,7 +4849,6 @@ mod tests {
             assert!(app.panel_fonts.iter().all(|f| f.is_null()));
             UnregisterClassW(name.as_ptr(), instance);
             let _ = std::fs::remove_file(manager::state_path());
-            let _ = std::fs::remove_file(status_path());
         }
     }
     #[test]
@@ -4907,7 +4905,6 @@ mod tests {
             bridge,
             panel_fonts: [null_mut(); 3],
             panel_icons: [null_mut(); 2],
-            snapshot_error: None,
             last_activity_refresh: Instant::now(),
             picker_ids: Vec::new(),
             page: Page::Main,
@@ -5033,7 +5030,6 @@ mod tests {
         assert!(app.manager.devices[0].error.is_none());
         assert_eq!(app.success_count, 1);
         assert_ne!(app.manager.devices[0].last_success, Some(100));
-        let _ = std::fs::remove_file(status_path());
         let _ = std::fs::remove_file(manager::state_path());
     }
     #[test]

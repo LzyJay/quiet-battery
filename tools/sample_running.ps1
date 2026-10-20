@@ -6,10 +6,26 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$statePath = Join-Path $projectRoot '.build/runtime-status.json'
 $releasePath = Join-Path $projectRoot 'dist/quiet-battery.exe'
+function Get-QuietBatteryStatus {
+    $qbInfo = [Diagnostics.ProcessStartInfo]::new()
+    $qbInfo.FileName = $releasePath; $qbInfo.Arguments = '--status'
+    $qbInfo.UseShellExecute = $false; $qbInfo.CreateNoWindow = $true
+    $qbInfo.RedirectStandardOutput = $true; $qbInfo.RedirectStandardError = $true
+    $qbInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $qbProcess = [Diagnostics.Process]::new(); $qbProcess.StartInfo = $qbInfo
+    try {
+        if (-not $qbProcess.Start()) { throw 'Status query failed to start.' }
+        $qbRead = $qbProcess.StandardOutput.ReadToEndAsync()
+        $qbError = $qbProcess.StandardError.ReadToEndAsync()
+        if (-not $qbProcess.WaitForExit(6000)) { $qbProcess.Kill(); throw 'Status query timed out.' }
+        $qbText = $qbRead.GetAwaiter().GetResult()
+        if ($qbProcess.ExitCode -ne 0) { throw "Status query failed: $($qbError.GetAwaiter().GetResult())" }
+        return $qbText | ConvertFrom-Json
+    } finally { $qbProcess.Dispose() }
+}
 if ($TargetProcessId -eq 0) {
-    $initialState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $initialState = Get-QuietBatteryStatus
     $TargetProcessId = [int]$initialState.pid
 }
 $targetProcess = Get-Process -Id $TargetProcessId
@@ -48,7 +64,7 @@ try {
         $statusProblem = $null
         $statusAge = $null
         try {
-            $candidateState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+            $candidateState = Get-QuietBatteryStatus
             $statusAge = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$candidateState.updated_unix
             if ([int]$candidateState.pid -ne $TargetProcessId) {
                 $statusProblem = 'wrong_process'
