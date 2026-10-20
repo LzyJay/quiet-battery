@@ -16,6 +16,8 @@
 - GitHub CLI及API复核：仓库push/admin允许，当前OAuth作用域仅gist/read:org/repo，缺workflow。自动构建仍只有模板，未启用或宣称Actions已通过；开发说明已给出授权与启用步骤。
 - EXE为1,610,752字节，CLI及Windows文件/产品资源版本0.3.2。SHA256：`7835c5902dda1e5436fea7c196b36a4b8695e12a64cbda79c2eea534d2f625ac`。失败复现、完整构建、短采样及运行状态留在被忽略的validation目录。
 
+- 已通过GitHub CLI发布正式[v0.3.2](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.3.2)并设为latest；下载回的EXE、SHA256SUMS和LICENSES三份附件逐一哈希一致，CLI及Windows文件/产品资源均为0.3.2。v0.3.1、v0.3.0、v0.2.3和v0.2.2全部保留，未删除旧Release或附件。
+
 ## v0.3.1：按需设备适配报告
 
 2026-10-20，Windows10 x64 / build19045，G304。本次补充诊断与交付入口，没有增加型号适配。
