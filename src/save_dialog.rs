@@ -97,6 +97,53 @@ pub fn choose(
         .map_err(|_| DeviceError::Protocol("保存窗口输出不是UTF-8".into()))?;
     decode(&text)
 }
+// A crashed tray process cannot cancel its outstanding picker. Keep an exact
+// process handle (rather than polling a reusable PID) and end this temporary
+// process if its owner exits. No watcher exists in the resident tray process.
+fn watch_owner(owner: HWND) -> Result<(), String> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{
+            GetCurrentProcessId, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        },
+        UI::WindowsAndMessaging::GetWindowThreadProcessId,
+    };
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(owner, &mut pid);
+    }
+    if pid == 0 || pid == unsafe { GetCurrentProcessId() } {
+        return Err("保存窗口所属进程无效".into());
+    }
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if process.is_null() {
+        return Err(format!(
+            "无法监视保存窗口所属进程：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let handle = process as usize;
+    if let Err(error) = std::thread::Builder::new()
+        .name("save-picker-owner".into())
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            unsafe {
+                WaitForSingleObject(handle as _, INFINITE);
+            }
+            unsafe {
+                CloseHandle(handle as _);
+            }
+            // Losing the owner or the wait handle leaves no valid recipient.
+            std::process::exit(1);
+        })
+    {
+        unsafe {
+            CloseHandle(process);
+        }
+        return Err(format!("无法监视保存窗口所属进程：{error}"));
+    }
+    Ok(())
+}
 /// Only the explicit helper CLI executes this. No monitor, settings, BAS
 /// runtime or single-instance lock is initialized in the helper.
 pub fn run_helper(argument: Option<String>) -> Result<(), String> {
@@ -109,6 +156,7 @@ pub fn run_helper(argument: Option<String>) -> Result<(), String> {
     {
         return Err("保存窗口所属主窗口已关闭".into());
     }
+    watch_owner(owner)?;
     // Resolve dynamically so the tray instance does not even load comdlg32.
     // Leave the module loaded until this short-lived helper exits.
     let module = unsafe {

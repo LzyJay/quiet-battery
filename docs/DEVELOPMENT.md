@@ -12,7 +12,7 @@ Windows x64、Rust stable、MSVC工具链与Windows SDK。当前验证工具链�
 
 运行中的EXE先正常退出再替换；不要结束鼠标驱动或改变自启偏好。发布由维护者选择通过验证的成品。
 
-`tools/github-actions-build.yml.example` 提供执行相同检查的工作流模板。当前GitHub登录不含workflow权限，因此未启用；有该权限的维护者可将其复制到 `.github/workflows/build.yml` 后提交。
+`tools/github-actions-build.yml.example` 提供执行相同检查的工作流模板。2026-10-20复核：仓库可写且账号为管理员，但CLI OAuth令牌仅有`gist/read:org/repo`，缺`workflow`，因此尚未启用。仓库写权限不能替代[OAuth workflow作用域](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps)。维护者可先执行`gh auth refresh -h github.com -s workflow`并完成浏览器授权，再将模板复制到 `.github/workflows/build.yml` 提交，等待实际Actions成功后才标记启用。
 
 图标已提交，普通构建不需要Python。修改图标后用Python/Pillow执行 `tools/generate_assets.py`，同时核对原生显示。升级依赖或Rust后执行 `python tools/update_notices.py`；需要对应rust-docs，或同一编译器的已提交声明。
 
@@ -90,3 +90,11 @@ Input / Output / Feature 长度来自零访问权限句柄的 `HidD_GetPreparsed
 普通用户直接使用添加页的复制/导出；支持已监控和未适配设备。报告格式见ADDING_DEVICES，公开样例只使用合成字段，不提交本机原始报告。后台串行采集，与监控缓存分开，不修改提醒状态；完成消息仍唤醒主循环。报告2MiB、相关HID32集合、BLE候选32与电池服务4个有界；HID枚举预算8秒、标准BLE诊断预算5秒，同步Windows调用仍可能超出软预算。
 
 保存窗口由同EXE内部参数`--support-save-dialog <owner-hwnd>`启动，属于临时实现接口，不是用户自启入口。独立STA只负责选路径，不采集设备、不读写设置，不经过单实例锁；取消/退出会结束子进程，管道读取线程随之join。实际报告由现有串行worker写到选定位置。测试须区分模拟取消/文件错误、真实保存窗口与BAS真机路径，并在导出后检查资源，避免将系统文件窗口缓存留在常驻进程。
+
+## 无外设的异常回归
+
+`src/fault_tests.rs`只编入测试二进制。完整build会执行：真实Windows ACL拒绝、独占文件锁、保存重试、迁移发布前/后强制终止及并发目标保护；保存窗口取消和所属进程强制退出在私有桌面完成。启动错误弹窗使用实际设置锁错误，代理不切换用户桌面或接管鼠标。
+
+测试文件仅在`.build/tmp/fault-*`；ACL只施加到新建夹具并恢复。测试子进程入口与暂停点均为`cfg(test)`，发布EXE不接受数据目录覆盖或故障环境变量，不改真实LocalAppData、自启、外设或厂商驱动。进程终止不等于物理断电；隐藏桌面弹窗不等于用户交互桌面的故障演练。
+
+普通导出失败/取消会清理自有临时文件；若在写报告时强制结束进程，可能在所选目录留下`.quiet-battery-<pid>-<sequence>.tmp`，发布前的旧报告不变。确认进程退出后可删除该文件；程序不为此记录所有导出路径或扫描清理用户目录。

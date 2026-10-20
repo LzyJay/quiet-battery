@@ -263,6 +263,8 @@ pub fn save(path: &Path, json: &str, cancel: &Cancellation) -> Result<(), Device
         file.sync_all()
             .map_err(|e| DeviceError::Io(e.to_string()))?;
         drop(file);
+        #[cfg(test)]
+        crate::fault_tests::pause("export-before-publish");
         cancel.check()?;
         let from = crate::startup::wide(&temporary.to_string_lossy());
         let to = crate::startup::wide(&path.to_string_lossy());

@@ -76,7 +76,7 @@ fn legacy_directories(executable: &Path) -> Vec<PathBuf> {
     }
     paths
 }
-fn migrate(target: &Path, legacy: &[PathBuf]) -> Result<(), String> {
+pub(crate) fn migrate(target: &Path, legacy: &[PathBuf]) -> Result<(), String> {
     let destination = target.join(STATE);
     for source_dir in legacy {
         if source_dir == target {
@@ -100,7 +100,20 @@ fn migrate(target: &Path, legacy: &[PathBuf]) -> Result<(), String> {
                     let written = file.write_all(&bytes).and_then(|_| file.sync_all());
                     drop(file);
                     written.map_err(|e| e.to_string())?;
-                    fs::rename(&temporary, &destination).map_err(|e| e.to_string())?;
+                    #[cfg(test)]
+                    crate::fault_tests::pause("migration-before-publish");
+                    if unsafe {
+                        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                            crate::startup::wide(&temporary.to_string_lossy()).as_ptr(),
+                            crate::startup::wide(&destination.to_string_lossy()).as_ptr(),
+                            windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+                        )
+                    } == 0
+                    {
+                        return Err(std::io::Error::last_os_error().to_string());
+                    }
+                    #[cfg(test)]
+                    crate::fault_tests::pause("migration-after-publish");
                     drop(guard);
                 }
                 // Existing settings win. Conflicting old data stays available;

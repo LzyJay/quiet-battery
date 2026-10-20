@@ -28,13 +28,15 @@ impl Mode {
     }
 }
 fn failure_text(error: &str) -> String {
-    let advice = if error.contains("迁移") || error.contains("LocalAppData") {
-        "请检查数据目录的访问权限，或关闭占用设置文件的程序后重试。旧设置已保留。"
-    } else if error.contains("已有实例") {
-        "请稍候重试；若仍无响应，请从托盘退出旧实例后重新启动。"
-    } else {
-        "请重新启动软件。若仍失败，请保留这条错误信息以便排查。"
-    };
+    let advice =
+        if error.contains("迁移") || error.contains("LocalAppData") || error.contains("设置文件")
+        {
+            "请检查设置文件和数据目录的访问权限，或关闭占用文件的程序后重试。原设置不会被覆盖。"
+        } else if error.contains("已有实例") {
+            "请稍候重试；若仍无响应，请从托盘退出旧实例后重新启动。"
+        } else {
+            "请重新启动软件。若仍失败，请保留这条错误信息以便排查。"
+        };
     format!("{error}\n\n{advice}")
 }
 pub fn show_error(error: &str) {
@@ -64,7 +66,7 @@ mod tests {
         assert_eq!(Mode::Background.existing_command(), app::REFRESH);
         let text = failure_text("无法迁移本地设置：拒绝访问");
         assert!(text.contains("拒绝访问"));
-        assert!(text.contains("旧设置已保留"));
+        assert!(text.contains("原设置不会被覆盖"));
         assert!(text.contains("访问权限"));
     }
 
@@ -83,7 +85,27 @@ mod tests {
             );
             assert!(!desktop.is_null());
             assert_ne!(SetThreadDesktop(desktop), 0);
-            show_error("无法迁移本地设置：测试拒绝访问");
+            use std::os::windows::fs::OpenOptionsExt;
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                ".build/tmp/native-startup-{}.state",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = b"QuietBattery\t6\npreferences\t0\t37\n";
+            std::fs::write(&path, original).unwrap();
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap();
+            let error = crate::manager::Manager::load(&path)
+                .err()
+                .expect("real sharing violation");
+            assert!(error.contains("无法读取设置文件"));
+            show_error(&error);
+            drop(lock);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            std::fs::remove_file(path).unwrap();
             CloseDesktop(desktop);
         }
     }

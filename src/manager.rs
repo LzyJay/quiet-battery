@@ -43,10 +43,19 @@ impl Default for Manager {
     }
 }
 impl Manager {
-    pub fn load(path: &Path) -> Self {
+    pub fn load(path: &Path) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::decode(&text),
-            Err(_) => Self::default(),
+            Ok(text) => {
+                if !matches!(
+                    text.lines().next(),
+                    Some("QuietBattery\t4" | "QuietBattery\t5" | "QuietBattery\t6")
+                ) {
+                    return Err("设置文件格式无法识别，原文件未修改".into());
+                }
+                Ok(Self::decode(&text))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(format!("无法读取设置文件：{error}")),
         }
     }
     pub fn selected(&self) -> impl Iterator<Item = &DeviceState> {
@@ -629,6 +638,25 @@ pub fn state_path() -> PathBuf {
 mod tests {
     use super::*;
     #[test]
+    fn locked_settings_must_not_silently_become_defaults() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            ".build/tmp/read-locked-{}.state",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"QuietBattery\t6\npreferences\t0\t37\n").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let loaded = Manager::load(&path);
+        drop(lock);
+        std::fs::remove_file(path).unwrap();
+        assert!(loaded.err().is_some_and(|e| e.contains("无法读取设置文件")));
+    }
+    #[test]
     fn v6_preferences_do_not_consume_the_512_device_budget() {
         let mut text = "QuietBattery\t6\npreferences\t0\t21\n".to_owned();
         for index in 0..513 {
@@ -687,7 +715,7 @@ mod tests {
             .join(format!(".build/tmp/manager-{}.state", std::process::id()));
         m.save(&path);
         assert!(m.persistence_error.is_none());
-        let restored = Manager::load(&path);
+        let restored = Manager::load(&path).unwrap();
         assert_eq!(restored.selected().count(), 1);
         assert!(restored.devices[0].removed);
         assert!(!restored.devices[0].show_tray);
@@ -765,7 +793,7 @@ mod tests {
             std::process::id()
         ));
         manager.save(&path);
-        let restored = Manager::load(&path);
+        let restored = Manager::load(&path).unwrap();
         let value = restored.devices[0].reading.as_ref().unwrap();
         assert_eq!(value.device_name, "Full model");
         assert_eq!(value.protocol, (4, 2));
@@ -904,7 +932,7 @@ mod tests {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join(format!(".build/tmp/alerts-{}.state", std::process::id()));
         manager.save(&path);
-        let mut restored = Manager::load(&path);
+        let mut restored = Manager::load(&path).unwrap();
         assert_eq!(restored.visible().count(), 1);
         assert!(!restored.notifications_enabled);
         assert!(!restored.devices[0].notify);

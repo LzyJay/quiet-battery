@@ -2,6 +2,8 @@
 
 mod app;
 mod device;
+#[cfg(test)]
+mod fault_tests;
 mod icons;
 mod launch;
 mod licenses;

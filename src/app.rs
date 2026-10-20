@@ -3405,6 +3405,8 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
     // Last CoUninitialize may discard non-COM messages during its cleanup pump.
     let _com = startup::Com::init()?;
     crate::storage::initialize()?;
+    // Fail before creating windows, worker threads or changing a legacy shortcut.
+    let manager = Manager::load(&manager::state_path())?;
     if let Err(error) = startup::upgrade_background() {
         unsafe {
             MessageBoxW(
@@ -3580,7 +3582,7 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             hwnd,
             panel: null_mut(),
             picker: null_mut(),
-            manager: Manager::load(&manager::state_path()),
+            manager,
             trays: Vec::new(),
             fallback: None,
             rows: Vec::new(),
@@ -4409,7 +4411,7 @@ mod tests {
             app.effects.state_path = Some(path.clone());
             app.effects.notification_sink = Some(Box::new(move |name, percent| {
                 assert!(
-                    Manager::load(&sink_path).devices[0].alert.notified,
+                    Manager::load(&sink_path).unwrap().devices[0].alert.notified,
                     "cycle must be durable before Shell submission"
                 );
                 let mut calls = sink_calls.borrow_mut();
