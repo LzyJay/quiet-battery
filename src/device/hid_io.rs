@@ -146,6 +146,34 @@ impl Session {
         cancel: &Cancellation,
         feature_only: bool,
     ) -> Result<Self, DeviceError> {
+        Self::open_rights(
+            path,
+            key,
+            lease,
+            cancel,
+            if feature_only {
+                0
+            } else {
+                GENERIC_READ | GENERIC_WRITE
+            },
+        )
+    }
+    /// Passive status collections need no write permission or feature access.
+    pub fn open_readonly(
+        path: &str,
+        key: &str,
+        lease: QueryGuard,
+        cancel: &Cancellation,
+    ) -> Result<Self, DeviceError> {
+        Self::open_rights(path, key, lease, cancel, GENERIC_READ)
+    }
+    fn open_rights(
+        path: &str,
+        key: &str,
+        lease: QueryGuard,
+        cancel: &Cancellation,
+        rights: u32,
+    ) -> Result<Self, DeviceError> {
         cancel.check()?;
         {
             let mut p = lock_pending()?;
@@ -160,11 +188,7 @@ impl Session {
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                if feature_only {
-                    0
-                } else {
-                    GENERIC_READ | GENERIC_WRITE
-                },
+                rights,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
@@ -465,6 +489,40 @@ mod tests {
             timeout: u32,
             security: *const c_void,
         ) -> HANDLE;
+    }
+    #[test]
+    fn passive_native_handle_reads_status_and_os_rejects_writes() {
+        let name = format!(r"\\.\pipe\quiet-battery-passive-{}", std::process::id());
+        let wide: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
+        let server =
+            OwnedHandle(unsafe { CreateNamedPipeW(wide.as_ptr(), 2, 0, 1, 64, 64, 0, null()) });
+        assert_ne!(server.0, INVALID_HANDLE_VALUE);
+        let cancel = Cancellation::default();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let lease = QueryGuard::acquire(&name, deadline, &cancel).unwrap();
+        let session = Session::open_readonly(&name, &name, lease, &cancel).unwrap();
+        let frame = [3, 0x30, 0x40, 1, 89];
+        let mut count = 0;
+        assert_ne!(
+            unsafe { WriteFile(server.0, frame.as_ptr(), 5, &mut count, null_mut()) },
+            0
+        );
+        assert_eq!(
+            session.input_sized(5, deadline, &cancel).unwrap().unwrap(),
+            frame
+        );
+        let error = session.output(&frame, deadline, &cancel).unwrap_err();
+        assert!(matches!(error,DeviceError::Io(ref e) if e.contains("Win32 5")));
+        assert!(
+            session
+                .input_sized(5, Instant::now() + Duration::from_millis(5), &cancel)
+                .unwrap()
+                .is_none()
+        );
+        drop(session);
+        let mut p = lock_pending().unwrap();
+        reap(&mut p);
+        assert!(!p.operations.iter().any(|op| op.device.key == name));
     }
     #[test]
     fn pending_native_read_cancels_without_releasing_live_memory() {

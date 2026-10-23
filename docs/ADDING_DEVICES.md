@@ -18,6 +18,7 @@
 - `src/device/compx.rs` / `razer.rs`：本次新增协议与静态profile，先看[设备支持表](DEVICE-SUPPORT.md)的精确ID、控制集合和固定来源版本。同协议新型号通常补MODELS条目；不同接口、report长度、事务ID或充电字段须补规则与测试，不只加名称。
 - `src/device/vendor_hid.rs`：共用原生事务桥与发现，两个模块直接复用；`Transport`可用模拟脚本测试完整查询。
 - `src/device/darmoshark.rs`：已验证 N3 的旧版 Feature 协议；原生有界传输在 `hid_io.rs`。相同品牌或类似 VID/PID 不足以复用该协议。
+- `src/device/delux.rs`：多彩Beken被动状态，先核对接收器与000A:0000集合，再按MODELS中的型号码/事件识别。共用接收器不按名称猜品牌；同协议补Model和原始样本/事件依据，其他主控新建协议。无帧不造读数，不向普通输入集合或未知Feature发命令；范围见设备支持表。
 - `src/device/discovery.rs`：公共HID候选与Windows ContainerId分组，排除适配器已认领的物理设备；新品牌不要复制公共枚举。
 - `src/device/bas.rs`：共用标准 BLE BAS，180F / 2A19 和可选 2BED；支持已配对、当前连接且已有访问许可的设备，不自动配对或请求同意。标准服务缺失不等于任意蓝牙私有协议已适配。
 - `src/device/support.rs`：所选设备的按需适配报告、静态入口判断、错误脱敏与原子导出；`src/save_dialog.rs`仅负责临时进程中的系统保存窗口。

@@ -110,6 +110,12 @@ fn matching(collections: &[Collection]) -> String {
                 "Profile exists, but required usage/interface/report lengths do not match or are unavailable"
             } else { "Profile and control collection match; no battery command sent by this report" })));
     }
+    result.push(format!(
+        "{{\"adapter\":\"delux\",\"receiver_profile_matched\":{},\"status_endpoint_matched\":{},\"reason\":{}}}",
+        collections.iter().any(super::delux::receiver),
+        collections.iter().any(super::delux::target),
+        quote("Requires 1D57 FA60/FA65, dedicated 000A:0000 five-byte input-only collection, then a recognized frame model/event. Shared USB IDs alone do not identify DELUX. This support report does not read the input stream.")
+    ));
     format!("[{}]", result.join(","))
 }
 fn os_json() -> String {

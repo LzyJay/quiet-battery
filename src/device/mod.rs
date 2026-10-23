@@ -2,6 +2,7 @@
 mod bas;
 mod compx;
 mod darmoshark;
+mod delux;
 mod diagnostics;
 mod discovery;
 mod hid_io;
@@ -274,6 +275,7 @@ static ADAPTERS: &[&dyn ProtocolAdapter] = &[
     &bas::BasAdapter,
     &darmoshark::DarmosharkAdapter,
     &compx::ADAPTER,
+    &delux::DeluxAdapter,
     &razer::ADAPTER,
 ];
 pub struct Registry;

@@ -6,7 +6,7 @@
 |---|---|
 | 主程序 | Rust 2024；错误类型、身份、缓存、提醒周期与串行工作线程 |
 | 窗口与托盘 | `windows-sys` 调Win32/GDI/Shell；原生窗口和控件语义，自绘像素；不加载网页运行时 |
-| 2.4G查询 | HID++ 使用 `hidapi` Windows native 后端；N3、Compx和Razer使用有界原生重叠I/O；报文只在适配器，界面不接触协议 |
+| 2.4G查询 | HID++ 使用 `hidapi` Windows native 后端；N3、Compx、Razer及DELUX状态通道使用有界原生重叠I/O；报文只在适配器，界面不接触协议 |
 | 蓝牙 | `windows` / WinRT访问标准GATT Battery Service |
 | 自启 | 用户Startup的`.lnk`，Shell Link COM；用户禁用后不自行恢复 |
 | 图标 | 透明掩码和ICO编入EXE；Python/Pillow仅用于开发期再生成 |
@@ -22,8 +22,9 @@
 - `src/device/diagnostics.rs`：独立 SetupDi HID 接口清单，访问失败仍保留端点；按需零访问权限查询原生 caps，无输入流、配置或协议流量。默认报告使用局部分组标签，显式标识符导出才附路径/容器；有界文本、数量、时间和取消，失败与截断显式报告。
 - `src/device/darmoshark.rs`：仅匹配已验证 N3 接收器及厂商集合；用官方只读命令核对接收器所配设备，再取得电量。不完整发现、休眠及通信失败保留缓存，确认配对身份变化后隐藏旧设备。没有 unit identity，不能区分同接收器重新配对的另一台同型号 N3。
 - `src/device/compx.rs` / `razer.rs`：只读协议与明确profile，分别核对FF02:0002的17字节厂商集合和MI00的91字节Feature集合；前者读取协议电源标记，后者独立查询充电。具体ID及来源见[设备支持表](DEVICE-SUPPORT.md)。
+- `src/device/delux.rs`：Beken专用000A:0000五字节只读状态集合；接收器ID+帧内型号/事件双重筛选，首次成功才认领。每次最多2.3秒/64帧，不新增监听线程。休眠不清零，按物理接收器、PID和帧标识隔离；不读普通鼠标输入、不冻结充电读数。
 - `src/device/vendor_hid.rs`：两者共用的有界发现、物理身份、候选失败隔离和原生传输桥；每个端点事务共享1.6秒预算，最多4个符合条件的控制集合，不打开普通输入流。
-- `src/device/hid_io.rs`：共享原生重叠Feature、Output和指定长度vendor Input；N3事务共享1.5秒预算，取消清理最多额外等100毫秒。极端驱动取消未完成时，最多保留 8 份请求及其句柄、内存与接收器锁，在原线程确认完成后释放；未完成端点拒绝新查询。不新增清理线程，不读取正常键鼠输入。
+- `src/device/hid_io.rs`：共享原生重叠Feature、Output和指定长度vendor Input；新增GENERIC_READ专用入口供DELUX使用，未改变原Feature零访问与其他读写入口；N3事务共享1.5秒预算，取消清理最多额外等100毫秒。极端驱动取消未完成时，最多保留 8 份请求及其句柄、内存与接收器锁，在原线程确认完成后释放；未完成端点拒绝新查询。不新增清理线程，不读取正常键鼠输入。
 - `src/manager.rs`：按身份独立的监控/托盘/提醒选择，成功缓存及v6本地状态；向后读取v4/v5。读取返回Result，只有NotFound可用默认值；访问失败、无效UTF-8及未知文件头停止启动，既有合法版本内的逐行容错保持。
 - `src/notifications.rs`：品牌无关的提醒周期与Windows提交。新有效读数推进周期，保存成功后投递；失败保留待投递项。
 - `src/app.rs`：主线程消息循环、三页控件、后台任务/结果桥、Shell菜单。同步回调也显式唤醒循环。
