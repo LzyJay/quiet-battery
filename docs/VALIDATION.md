@@ -14,6 +14,8 @@
 - README、扩展指南和任务清单已更新M900 Pro首次移动/添加页刷新步骤。待确认实际接收器、固件、初次上报、充电和满电、实体休眠恢复、厂家软件并发与同类多台。旧248A M800 Feature、不同主控Ultra/Pro+、M618私有2.4G和有线通道未纳入此次，不按系列名扩大支持。
 - EXE为1,626,112字节，CLI及Windows文件/产品资源均0.4.0。SHA256：`9a3d0e77f3615b5f930fef926aee9e40d2820766adb3e15c46bd9af6580a7d62`。官网原包、研究记录、原始扫描和本机状态仅留被忽略的validation目录。
 
+- 已通过GitHub CLI发布正式[v0.4.0](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.4.0)并设为latest。重新下载EXE、SHA256SUMS和LICENSES三份附件，逐一哈希一致，CLI及Windows文件/产品资源均为0.4.0。既有v0.3.2、v0.3.1、v0.3.0、v0.2.3和v0.2.2全部保留，未删除旧Release或附件。
+
 ## v0.3.2：启动、迁移与导出异常保护
 
 2026-10-20，Windows10 x64 / G304。不新增别名、排序、更新或型号适配。
