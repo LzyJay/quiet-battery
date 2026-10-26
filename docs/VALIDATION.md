@@ -46,7 +46,7 @@
 - README、扩展指南和任务清单已更新M900 Pro首次移动/添加页刷新步骤。待确认实际接收器、固件、初次上报、充电和满电、实体休眠恢复、厂家软件并发与同类多台。旧248A M800 Feature、不同主控Ultra/Pro+、M618私有2.4G和有线通道未纳入此次，不按系列名扩大支持。
 - EXE为1,626,112字节，CLI及Windows文件/产品资源均0.4.0。SHA256：`9a3d0e77f3615b5f930fef926aee9e40d2820766adb3e15c46bd9af6580a7d62`。官网原包、研究记录、原始扫描和本机状态仅留被忽略的validation目录。
 
-- 已通过GitHub CLI发布正式[v0.4.0](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.4.0)并设为latest。重新下载EXE、SHA256SUMS和LICENSES三份附件，逐一哈希一致，CLI及Windows文件/产品资源均为0.4.0。既有v0.3.2、v0.3.1、v0.3.0、v0.2.3和v0.2.2全部保留，未删除旧Release或附件。
+- 已发布正式 v0.4.0 并设为 latest。重新下载EXE、SHA256SUMS和LICENSES三份附件，逐一哈希一致，CLI及Windows文件/产品资源均为0.4.0。既有v0.3.2、v0.3.1、v0.3.0、v0.2.3和v0.2.2全部保留，未删除旧Release或附件。
 
 ## v0.3.2：启动、迁移与导出异常保护
 
@@ -62,7 +62,7 @@
 - GitHub CLI及API复核：仓库push/admin允许，当前OAuth作用域仅gist/read:org/repo，缺workflow。自动构建仍只有模板，未启用或宣称Actions已通过；开发说明已给出授权与启用步骤。
 - EXE为1,610,752字节，CLI及Windows文件/产品资源版本0.3.2。SHA256：`7835c5902dda1e5436fea7c196b36a4b8695e12a64cbda79c2eea534d2f625ac`。失败复现、完整构建、短采样及运行状态留在被忽略的validation目录。
 
-- 已通过GitHub CLI发布正式[v0.3.2](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.3.2)并设为latest；下载回的EXE、SHA256SUMS和LICENSES三份附件逐一哈希一致，CLI及Windows文件/产品资源均为0.3.2。v0.3.1、v0.3.0、v0.2.3和v0.2.2全部保留，未删除旧Release或附件。
+- 已发布正式 v0.3.2 并设为 latest；下载回的EXE、SHA256SUMS和LICENSES三份附件逐一哈希一致，CLI及Windows文件/产品资源均为0.3.2。v0.3.1、v0.3.0、v0.2.3和v0.2.2全部保留，未删除旧Release或附件。
 
 ## v0.3.1：按需设备适配报告
 
@@ -76,7 +76,7 @@
 - 本机蓝牙诊断走“没有同身份已配对BLE端点”分支；没有据此判断设备不含BAS。新诊断的真实180F/2A19/2BED读取、订阅保留、断开与许可错误尚待真机，已列入任务清单；旧版基本BAS读数不能替代这些验证。
 - EXE为1,609,216字节，CLI及Windows文件/产品资源版本0.3.1。SHA256：`7aff31539995c956c05022ea253779c20979455ebf33b7f65d3d8ded26ec6240`。原始导出、剪贴板、实际截图、短采样与运行记录仅留被忽略的validation目录。
 
-- 已通过GitHub CLI发布正式[v0.3.1](https://github.com/TheWebDog/quiet-battery/releases/tag/v0.3.1)并设为latest。下载回的EXE、SHA256SUMS和LICENSES三份附件逐一哈希一致，CLI及Windows文件/产品资源均为0.3.1。保留v0.3.0、v0.2.3和v0.2.2，未删除旧Release或附件。
+- 已发布正式 v0.3.1 并设为 latest。下载回的EXE、SHA256SUMS和LICENSES三份附件逐一哈希一致，CLI及Windows文件/产品资源均为0.3.1。保留v0.3.0、v0.2.3和v0.2.2，未删除旧Release或附件。
 
 ## v0.3.0：第一批常见型号协议适配
 
@@ -125,7 +125,7 @@
 
 发布成品为1,465,344字节，命令行及Windows文件/产品版本均为0.2.1。SHA256：`1ac6cdc268a2a2b4f4f3ec2e5990cb680048e441bad60c8c2bd939916c954929`。附件仅包含EXE、SHA256SUMS.txt和完整LICENSES.txt；原始设备身份、调查数据和本机缓存不进入发布包。
 
-已发布v0.2.1（[历史标签](https://github.com/TheWebDog/quiet-battery/tree/v0.2.1)）并设为latest（非草稿、非预发布）。通过GitHub CLI重新下载三个附件，EXE及两个文本附件均与本地逐一核对SHA256一致；下载版CLI和Windows文件/产品版本均为0.2.1。按用户要求删除0.1.1及0.1.0的Release和附件，当时仅保留0.2.1与0.2.0，未删除Git标签或提交历史。
+已发布 v0.2.1（历史标签 v0.2.1）并设为 latest（非草稿、非预发布）。通过GitHub CLI重新下载三个附件，EXE及两个文本附件均与本地逐一核对SHA256一致；下载版CLI和Windows文件/产品版本均为0.2.1。按用户要求删除0.1.1及0.1.0的Release和附件，当时仅保留0.2.1与0.2.0，未删除Git标签或提交历史。
 
 ## v0.2.1发布前：按钮原生样式闪烁修复
 
