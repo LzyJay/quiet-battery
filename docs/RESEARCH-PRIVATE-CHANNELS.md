@@ -160,6 +160,7 @@
 3. **七元组记录**。每次请求记 `requestType / request / value / index / length / timeout / data`，缺一项就无法复现。
 4. **抓包优先于猜**。Wireshark + USBPcap 是多个项目共同采用的手段（Arctis Nova 7X、EZ2.4G、HeadsetControl 文档均提及）。抓的是厂商软件查询电量时的真实流量，不是我们盲发的流量。
 5. **不做的事**：不遍历未知命令、不向未知 Feature/Output 试写、不读键鼠输入流。这三条同时也是本仓库 `ADDING_DEVICES.md` 的既有约束。
+6. **先用自构造的请求对齐解析器**。请求帧是自己拼的，常量字段和校验字节都已知，用它验证偏移与校验算法，再去解回复。反过来拿回复反推偏移，会在错误里自我说服——见[调查踩坑记录](PITFALLS.md)第 9 条。
 
 ## 对本项目当前目标的意义
 
