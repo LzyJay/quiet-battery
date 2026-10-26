@@ -1,7 +1,7 @@
 //! Razer read-only power commands (class 07, battery 80, charging 84).
 //! Wire specification, source revisions and validation limits: docs/DEVICE-SUPPORT.md.
 use super::{
-    Cancellation, DeviceError, PowerState, Reading,
+    Cancellation, DeviceError, DeviceKind, PowerState, Reading,
     diagnostics::Collection,
     vendor_hid::{Adapter, Profile, Transport, number},
 };
@@ -38,6 +38,7 @@ pub(super) const ADAPTER: Adapter = Adapter {
     identify,
     accepts,
     feature_only: true,
+    kind: DeviceKind::Mouse,
     query,
 };
 fn checksum(payload: &[u8]) -> u8 {

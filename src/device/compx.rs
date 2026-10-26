@@ -1,7 +1,7 @@
 //! Compx 17-byte battery exchange; independently implemented from the wire contract.
 //! Sources and profile provenance: docs/DEVICE-SUPPORT.md (no imported driver code).
 use super::{
-    Cancellation, DeviceError, PowerState, Reading,
+    Cancellation, DeviceError, DeviceKind, PowerState, Reading,
     diagnostics::Collection,
     vendor_hid::{Adapter, Profile, Transport, number},
 };
@@ -40,6 +40,7 @@ pub(super) const ADAPTER: Adapter = Adapter {
     identify,
     accepts,
     feature_only: false,
+    kind: DeviceKind::Mouse,
     query,
 };
 fn request() -> [u8; 17] {

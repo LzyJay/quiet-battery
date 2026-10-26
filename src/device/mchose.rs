@@ -2,7 +2,7 @@
 //! Independently implemented from the wire contract; sources and provenance:
 //! docs/DEVICE-SUPPORT.md. No vendor driver code or binary is used at runtime.
 use super::{
-    Cancellation, DeviceError, PowerState, Reading,
+    Cancellation, DeviceError, DeviceKind, PowerState, Reading,
     diagnostics::Collection,
     vendor_hid::{Adapter, Profile, Transport, number},
 };
@@ -46,6 +46,7 @@ pub(super) const ADAPTER: Adapter = Adapter {
     identify,
     accepts,
     feature_only: false,
+    kind: DeviceKind::Mouse,
     query,
 };
 /// XOR of bytes 2..=end: the frame's own checksum contract.

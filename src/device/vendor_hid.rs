@@ -96,6 +96,7 @@ pub(super) struct Adapter {
     pub identify: fn(&Collection) -> Option<Profile>,
     pub accepts: fn(&Collection) -> bool,
     pub feature_only: bool,
+    pub kind: DeviceKind,
     pub query: fn(Profile, &dyn Transport, &Cancellation) -> Result<Reading, DeviceError>,
 }
 impl Adapter {
@@ -107,7 +108,7 @@ impl Adapter {
             endpoint: Some(endpoint),
             recoverable: true,
             name: p.name.into(),
-            kind: DeviceKind::Mouse,
+            kind: self.kind,
             supported: true,
             provider: self.name.into(),
         }

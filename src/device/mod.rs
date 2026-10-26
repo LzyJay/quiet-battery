@@ -9,6 +9,7 @@ mod discovery;
 mod hid_io;
 mod logitech;
 mod mchose;
+mod mchose_headset;
 mod razer;
 pub mod support;
 mod vendor_hid;
@@ -280,6 +281,7 @@ static ADAPTERS: &[&dyn ProtocolAdapter] = &[
     &compx::ADAPTER,
     &delux::DeluxAdapter,
     &mchose::ADAPTER,
+    &mchose_headset::ADAPTER,
     &razer::ADAPTER,
 ];
 pub struct Registry;
