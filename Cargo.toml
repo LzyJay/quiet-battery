@@ -5,8 +5,8 @@ edition = "2024"
 rust-version = "1.85"
 description = "Native Windows peripheral battery monitor with extensible protocol adapters"
 license = "PolyForm-Noncommercial-1.0.0"
-authors = ["TheWebDog"]
-repository = "https://github.com/TheWebDog/quiet-battery"
+authors = ["LzyJay"]
+repository = "https://github.com/LzyJay/quiet-battery"
 
 [dependencies]
 windows-future = "=0.2.1"

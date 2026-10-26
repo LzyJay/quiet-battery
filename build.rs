@@ -64,7 +64,7 @@ BEGIN
       VALUE "InternalName", "quiet-battery\0"
       VALUE "OriginalFilename", "quiet-battery.exe\0"
       VALUE "ProductName", "Quiet Battery\0"
-      VALUE "LegalCopyright", "Copyright (c) 2026 TheWebDog\0"
+      VALUE "LegalCopyright", "Copyright (c) 2026 LzyJay\0"
       VALUE "ProductVersion", "{version}\0"
     END
   END
