@@ -60,6 +60,8 @@ Windows 原生外设电量托盘工具。Rust + Win32，单 EXE，后台低频�
 | ATK / VXE / VGN | 新增F1 Ultimate、A9 Ultimate、MAD R、MAD R Major Plus、R1 Pro Max、R1 SE+、F1 Pro、F2 Pro Max的明确接收器/有线ID与17字节协议；已实现、待真机确认 |
 | Razer | 新增Viper V2/V3 Pro、DeathAdder V3 Pro（含另一组ID）、Basilisk V3 Pro的明确接收器/有线ID，电量与独立充电查询；已实现、待真机确认 |
 | 多彩 DELUX（Beken 状态通道） | v0.4.0新增M900 Pro、M900/M900 Mini、M800 Mini、M600 Pro/8K、M500 Pro、M700 Pro、M300 Pro及部分M800 Pro变体；仅表中1D57:FA60/FA65接收器和17组帧标识，已实现、待真机确认 |
+| 迈从 MCHOSE（HUB Protocol V2） | 本轮新增A5 V3 Ultra：2.4G接收器`3837:1014`、供应商集合`FF01:0001`、64字节Output report `4D`；本机连续3次真实读到69%，校验和、连接方式与充电字段已核对。有线`3837:4034`由设备回复自报，未在有线模式实测 |
+| 经典蓝牙耳机（HFP 电池属性） | 本轮新增：读取 Windows 在 `BthHFEnum` 节点保存的 HFP `AT+BIEV` 电量。HONOR Earbuds S 100%、Redmi Buds 4 Pro 100%、荣耀亲选头戴式耳机2 80%、Redmi Buds 3 75%、MCHOSE V9 Pro 2 90%，均与 Windows 设置一致。数值为最近一次上报，断开后保留旧值；该属性不提供充电状态 |
 | 标准蓝牙 BAS：180F / 2A19 | 曾真实取得广播名BT5.0 KB的100%；零售型号、订阅与充电场景未确认 |
 | 其他设备 | 需要核对共用协议或新增适配器；枚举到设备不等于能读电量 |
 

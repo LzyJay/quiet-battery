@@ -284,7 +284,10 @@ pub(super) mod tests {
     }
     impl Transport for Script {
         fn drain(&self, length: usize) -> Result<(), DeviceError> {
-            assert_eq!(length, 17);
+            assert!(
+                matches!(length, 17 | 64),
+                "unexpected drain length {length}"
+            );
             match self.next() {
                 Step::Drain => Ok(()),
                 _ => panic!("expected drain"),

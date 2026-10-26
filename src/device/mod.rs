@@ -1,5 +1,6 @@
 //! Read-only protocol adapters and common, device-independent battery values.
 mod bas;
+mod bt_hfp;
 mod compx;
 mod darmoshark;
 mod delux;
@@ -7,6 +8,7 @@ mod diagnostics;
 mod discovery;
 mod hid_io;
 mod logitech;
+mod mchose;
 mod razer;
 pub mod support;
 mod vendor_hid;
@@ -273,9 +275,11 @@ impl ProtocolAdapter for HidppAdapter {
 static ADAPTERS: &[&dyn ProtocolAdapter] = &[
     &HidppAdapter,
     &bas::BasAdapter,
+    &bt_hfp::BtHfpAdapter,
     &darmoshark::DarmosharkAdapter,
     &compx::ADAPTER,
     &delux::DeluxAdapter,
+    &mchose::ADAPTER,
     &razer::ADAPTER,
 ];
 pub struct Registry;
