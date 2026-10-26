@@ -35,6 +35,8 @@ Registry 是集中入口。新增协议实现 `ProtocolAdapter` 的 `name`、`ow
 
 描述中 `physical_id` 标识物理容器，`endpoint` 标识容器内的槽位或逻辑连接，`id` 标识具体外设，`provider` 对应适配器的 `name`。`recoverable` 表示活动后可重试发现的连接。临时失败候选沿用相同容器/端点；整台接收器不可查询时，端点可为 None。Manager 用这些通用字段关联缓存，不解析品牌 ID。新模块沿用现有类型，不改 Manager、窗口或托盘分发。
 
+描述符还需声明 `connection`：接收器（2.4G）、经典蓝牙、蓝牙LE、有线、直连（无法区分有线与蓝牙时）或未知。它必须是适配器自己的证据（比如匹配的 profile 是接收器 PID 还是有线 PID、走 HFP 节点还是 BLE GATT），不能从设备名推断。没有证据就填未知，界面会如实显示未知而不是猜一个。该字段不写入设置文件，旧缓存读入时为未知，下一次发现即刷新。经典蓝牙设备还需在发现时用 `BluetoothGetDeviceInfo` 的 `fConnected` 过滤未连接的设备——节点存在不等于已连接。
+
 解析出数值后使用 `Reading::from_percent(name, percent, power)`；纯档位使用 `Reading::from_levels(name, current, total)`，不需要伪造 HID++ 字段。协议专用诊断字段只在确实读取到时填写。旧缓存缺少的元数据以 `metadata_known=false` 表示，不能宣称协议版本为 0.0。
 
 `discover` 和 `read` 都接收 `Cancellation`；在枚举、槽位和等待循环之间调用 `check()`。返回 `Cancelled` 时丢弃本次未完成扫描，不将半份结果合并为断开状态。单个适配器失败通过 `DiscoveryReport.failures` 独立记录，不中断其他适配器。
