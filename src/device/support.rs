@@ -296,7 +296,7 @@ pub fn save(path: &Path, json: &str, cancel: &Cancellation) -> Result<(), Device
 }
 #[cfg(test)]
 mod tests {
-    use super::super::{DeviceKind, PowerState, diagnostics::Field};
+    use super::super::{Connection, DeviceKind, PowerState, diagnostics::Field};
     use super::*;
     fn context() -> SupportContext {
         SupportContext {
@@ -309,6 +309,7 @@ mod tests {
                 kind: DeviceKind::Mouse,
                 supported: false,
                 provider: "unsupported".into(),
+                connection: Connection::Unknown,
             },
             reading: Some(
                 Reading::from_percent("fixture mouse".into(), 35, PowerState::Discharging).unwrap(),

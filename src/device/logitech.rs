@@ -152,6 +152,13 @@ pub(super) fn discover(cancel: &Cancellation) -> Result<Vec<Candidate>, DeviceEr
                             kind,
                             supported: true,
                             provider: "hidpp".into(),
+                            // Slot index 0x00FF is the direct endpoint; anything else
+                            // answered through a receiver slot.
+                            connection: if index == 0xff {
+                                super::Connection::Direct
+                            } else {
+                                super::Connection::Receiver
+                            },
                         },
                         reading: Some(reading),
                         error: None,
@@ -173,6 +180,7 @@ pub(super) fn discover(cancel: &Cancellation) -> Result<Vec<Candidate>, DeviceEr
                     kind: DeviceKind::Generic,
                     supported: false,
                     provider: "hidpp".into(),
+                    connection: super::Connection::Unknown,
                 },
                 reading: None,
                 error: last_error,

@@ -216,6 +216,8 @@ fn descriptor(c: &Collection, model: Model) -> DeviceDescriptor {
         kind: DeviceKind::Mouse,
         supported: true,
         provider: PROVIDER.into(),
+        // Only the 1D57:FA60/FA65 receivers are claimed by this adapter.
+        connection: super::Connection::Receiver,
     }
 }
 fn query(

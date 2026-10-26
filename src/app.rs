@@ -63,6 +63,11 @@ const BACK: u32 = 109;
 const ALERTS: u32 = 110;
 const THRESHOLD: u32 = 111;
 const PICK_REFRESH: u32 = 112;
+const CONNECTIONS: u32 = 115;
+const AUTO_REFRESH: u32 = 116;
+const REFRESH_INTERVAL: u32 = 117;
+const INTERVAL_LABEL: u32 = 118;
+const INTERVAL_UNIT: u32 = 119;
 const SETTINGS_BASE: u32 = 4000;
 const ADD_BASE: u32 = 8000;
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -119,6 +124,7 @@ struct PanelView {
     scroll: i32,
     page: Page,
     threshold_error: bool,
+    interval_error: bool,
     rows: Vec<DeviceState>,
     symbols: Vec<Rc<SymbolIcon>>,
 }
@@ -191,6 +197,8 @@ enum UiEvent {
     PageCommand(u32),
     Threshold(bool),
     ThresholdEdited,
+    Interval(bool),
+    IntervalEdited,
 }
 struct TrayEntry {
     id: String,
@@ -226,6 +234,7 @@ type NotificationSink = Box<dyn FnMut(&str, u8) -> bool>;
 struct TestEffects {
     state_path: Option<PathBuf>,
     notification_sink: Option<NotificationSink>,
+    connection_toasts: Vec<(String, bool)>,
     support_copies: Vec<String>,
     support_path: Option<PathBuf>,
 }
@@ -253,7 +262,7 @@ struct App {
     refresh_count: u64,
     success_count: u64,
     bridge: Rc<UiBridge>,
-    panel_fonts: [HFONT; 3],
+    panel_fonts: [HFONT; 4],
     panel_icons: [HICON; 2],
     last_activity_refresh: Instant,
     picker_ids: Vec<String>,
@@ -261,6 +270,7 @@ struct App {
     page_scroll: [i32; 3],
     page_controls: Vec<HWND>,
     threshold_error: bool,
+    interval_error: bool,
     notification_submissions: u64,
     notification_last_accepted: bool,
     scroll: i32,
@@ -350,6 +360,35 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+/// Second line of a device row: how the device is attached and how old the
+/// shown percentage is. Times are derived from the last confirmed reading, never
+/// from an estimate.
+fn row_detail(state: &DeviceState) -> String {
+    let link = state.descriptor.connection.short_label();
+    if !state.connected {
+        return if state.connection_known {
+            format!("{link} · 未连接")
+        } else {
+            format!("{link} · 连接状态未知")
+        };
+    }
+    format!("{link} · {}", updated_age(state.last_success))
+}
+fn updated_age(last: Option<u64>) -> String {
+    let Some(time) = last else {
+        return "尚未读取".into();
+    };
+    let seconds = now().saturating_sub(time);
+    if seconds < 60 {
+        "刚刚更新".into()
+    } else if seconds < 3_600 {
+        format!("{} 分钟前", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{} 小时前", seconds / 3_600)
+    } else {
+        format!("{} 天前", seconds / 86_400)
+    }
+}
 pub fn replace_file(temporary: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
     if unsafe {
         MoveFileExW(
@@ -392,12 +431,13 @@ fn opt_number(value: Option<u64>) -> String {
 }
 pub fn descriptor_json(candidate: &Candidate) -> String {
     format!(
-        "{{\"id\":{},\"name\":{},\"kind\":{},\"supported\":{},\"provider\":{},\"reading\":{},\"error\":{},\"diagnostics\":{}}}",
+        "{{\"id\":{},\"name\":{},\"kind\":{},\"supported\":{},\"provider\":{},\"connection\":{},\"reading\":{},\"error\":{},\"diagnostics\":{}}}",
         json_string(&candidate.descriptor.id),
         json_string(&candidate.descriptor.name),
         json_string(candidate.descriptor.kind.key()),
         candidate.descriptor.supported,
         json_string(&candidate.descriptor.provider),
+        json_string(candidate.descriptor.connection.key()),
         candidate
             .reading
             .as_ref()
@@ -433,7 +473,7 @@ impl StatusView {
         let stale = first.is_none_or(|s| {
             s.error.is_some() || s.last_success.is_none_or(|t| now().saturating_sub(t) > 240)
         });
-        let devices=self.manager.devices.iter().map(|s|format!("{{\"id\":{},\"name\":{},\"kind\":{},\"supported\":{},\"selected\":{},\"removed\":{},\"show_tray\":{},\"tray_id\":{},\"connected\":{},\"last_success_unix\":{},\"reading\":{},\"error\":{}}}",json_string(&s.descriptor.id),json_string(&s.descriptor.name),json_string(s.descriptor.kind.key()),s.descriptor.supported,s.selected,s.removed,s.show_tray,self.tray_ids.iter().find(|(id,_)|*id==s.descriptor.id).map_or_else(||"null".into(),|(_,id)|id.to_string()),s.connected,opt_number(s.last_success),s.reading.as_ref().map_or_else(||"null".into(),reading_json),s.error.as_ref().map_or_else(||"null".into(),|e|json_string(&e.to_string())))).collect::<Vec<_>>().join(",");
+        let devices=self.manager.devices.iter().map(|s|format!("{{\"id\":{},\"name\":{},\"kind\":{},\"connection\":{},\"supported\":{},\"selected\":{},\"removed\":{},\"show_tray\":{},\"tray_id\":{},\"connected\":{},\"last_success_unix\":{},\"reading\":{},\"error\":{}}}",json_string(&s.descriptor.id),json_string(&s.descriptor.name),json_string(s.descriptor.kind.key()),json_string(s.descriptor.connection.key()),s.descriptor.supported,s.selected,s.removed,s.show_tray,self.tray_ids.iter().find(|(id,_)|*id==s.descriptor.id).map_or_else(||"null".into(),|(_,id)|id.to_string()),s.connected,opt_number(s.last_success),s.reading.as_ref().map_or_else(||"null".into(),reading_json),s.error.as_ref().map_or_else(||"null".into(),|e|json_string(&e.to_string())))).collect::<Vec<_>>().join(",");
         let startup = startup::status();
         let enabled = startup.as_ref().is_ok_and(|s| s.enabled);
         let value = format!(
@@ -477,10 +517,13 @@ impl StatusView {
             || value.clone(),
             |v| {
                 format!(
-                    "{v},\"page\":{},\"notifications_enabled\":{},\"threshold\":{}}}",
+                    "{v},\"page\":{},\"notifications_enabled\":{},\"threshold\":{},\"connection_notifications\":{},\"auto_refresh\":{},\"refresh_seconds\":{}}}",
                     json_string(self.page.key()),
                     self.manager.notifications_enabled,
-                    self.manager.threshold
+                    self.manager.threshold,
+                    self.manager.connection_notifications,
+                    self.manager.auto_refresh,
+                    self.manager.refresh_seconds
                 )
             },
         );
@@ -537,6 +580,7 @@ impl App {
             scroll: self.scroll,
             page: self.page,
             threshold_error: self.threshold_error,
+            interval_error: self.interval_error,
             rows: self.page_states(),
             symbols: self.rows.iter().map(|r| r.symbol.clone()).collect(),
         });
@@ -622,13 +666,25 @@ impl App {
             }
         }
     }
-    fn refresh(&mut self) {
-        self.refresh_ids(
-            self.manager
-                .selected()
-                .map(|s| s.descriptor.id.clone())
-                .collect(),
-        );
+    /// `rescan` lets an explicit user or power event rediscover when nothing is
+    /// currently present; the input-driven path must stay cheap.
+    /// `rescan` lets an explicit user or power event rediscover when nothing is
+    /// currently present; the input-driven path has to stay cheap.
+    fn refresh(&mut self, rescan: bool) {
+        // Only present devices are queried. A confirmed disconnect is left to the
+        // next discovery pass instead of being read again on every cycle.
+        let ids: Vec<_> = self
+            .manager
+            .visible()
+            .map(|s| s.descriptor.id.clone())
+            .collect();
+        if ids.is_empty() {
+            if rescan || self.manager.selected().next().is_none() {
+                self.discover();
+            }
+            return;
+        }
+        self.refresh_ids(ids);
     }
     fn refresh_ids(&mut self, ids: Vec<String>) {
         if self.busy {
@@ -742,7 +798,7 @@ impl App {
                         self.discover();
                     } else if self.pending {
                         self.pending = false;
-                        self.refresh();
+                        self.refresh(true);
                     }
                 }
                 WorkerResult::RefreshRequest(id) => self.refresh_ids(vec![id]),
@@ -751,6 +807,7 @@ impl App {
             self.update_icons(false);
             if fresh_result {
                 self.deliver_alerts();
+                self.deliver_connections();
             } else {
                 self.prune_alerts();
             }
@@ -915,6 +972,48 @@ impl App {
                         .retain(|(pending, _, _)| pending != &id);
                 }
             }
+        }
+    }
+    /// Deliver confirmed link transitions. The manager only queues transitions
+    /// whose previous state was known, so startup and first discovery stay quiet.
+    fn deliver_connections(&mut self) {
+        if self.manager.persistence_error.is_some() {
+            return;
+        }
+        for (id, connected) in std::mem::take(&mut self.manager.pending_connections) {
+            let Some(state) = self
+                .manager
+                .devices
+                .iter()
+                .find(|s| s.descriptor.id == id && s.selected && !s.removed)
+            else {
+                continue;
+            };
+            let name = self.manager.display_name(&id, true);
+            let percent = state
+                .reading
+                .as_ref()
+                .map(|reading| reading.normalized_percent());
+            let shell_id = self
+                .trays
+                .iter()
+                .find(|t| t.id == id)
+                .or(self.fallback.as_ref())
+                .or(self.trays.first())
+                .map(|t| t.shell_id);
+            #[cfg(test)]
+            let shell_id = shell_id.or(Some(1));
+            if let Some(shell_id) = shell_id {
+                let accepted = crate::notifications::show_connection(
+                    self.hwnd, shell_id, &name, connected, percent,
+                );
+                self.notification_last_accepted = accepted;
+                self.notification_submissions += 1;
+            }
+            #[cfg(test)]
+            self.effects
+                .connection_toasts
+                .push((name.clone(), connected));
         }
     }
     fn tray_data(&self, shell_id: u32) -> NOTIFYICONDATAW {
@@ -1151,7 +1250,7 @@ impl App {
             PostMessageW(self.hwnd, WM_NULL, 0, 0);
             match command {
                 DETAILS => self.show_panel(),
-                MENU_REFRESH => self.refresh(),
+                MENU_REFRESH => self.refresh(true),
                 ADD => self.show_picker(),
                 STARTUP => {
                     let enabled = startup::status().is_ok_and(|s| s.enabled);
@@ -1195,7 +1294,7 @@ impl App {
     fn row_top(&self) -> i32 {
         match self.page {
             Page::Main => 20,
-            Page::Settings => 264,
+            Page::Settings => 320,
             Page::Add => 76,
         }
     }
@@ -1204,7 +1303,7 @@ impl App {
     }
     fn content_height(&self) -> i32 {
         if self.rows.is_empty() {
-            if self.page == Page::Settings { 136 } else { 0 }
+            if self.page == Page::Settings { 256 } else { 0 }
         } else {
             self.row_top() - self.viewport_top() + self.rows.len() as i32 * 64
         }
@@ -1238,7 +1337,7 @@ impl App {
         let natural = if self.rows.is_empty() {
             match self.page {
                 Page::Main => 132,
-                Page::Settings => 226,
+                Page::Settings => 344,
                 Page::Add => 180,
             }
         } else {
@@ -1254,7 +1353,7 @@ impl App {
             let dpi = GetDpiForWindow(self.panel).max(96) as i32;
             let mut top = y * dpi / 96;
             let mut height = h * dpi / 96;
-            if GetDlgCtrlID(hwnd) == THRESHOLD as i32 {
+            if matches!(GetDlgCtrlID(hwnd) as u32, THRESHOLD | REFRESH_INTERVAL) {
                 // Single-line EDIT has no vertical alignment style. Center its
                 // font-sized client area inside the independently drawn frame.
                 let dc = GetDC(hwnd);
@@ -1281,8 +1380,9 @@ impl App {
         unsafe {
             let old_fonts = self.panel_fonts;
             let dpi = GetDpiForWindow(self.panel).max(96) as i32;
-            for (index, (height, weight)) in
-                [(15, 400), (17, 700), (26, 700)].into_iter().enumerate()
+            for (index, (height, weight)) in [(15, 400), (17, 700), (26, 700), (12, 400)]
+                .into_iter()
+                .enumerate()
             {
                 let font = CreateFontW(
                     -height * dpi / 96,
@@ -1342,10 +1442,15 @@ impl App {
                 if self.page == Page::Settings {
                     for (id, x, y, w, h) in [
                         (STARTUP, 24, 68, 512, 40),
-                        (ALERTS, 24, 116, 512, 40),
-                        (THRESHOLD, 464, 168, 56, 32),
+                        (ALERTS, 24, 116, 248, 40),
+                        (CONNECTIONS, 288, 116, 248, 40),
                         (113, 24, 168, 220, 32),
+                        (THRESHOLD, 464, 168, 56, 32),
                         (114, 524, 168, 12, 32),
+                        (AUTO_REFRESH, 24, 216, 248, 40),
+                        (INTERVAL_LABEL, 288, 220, 96, 32),
+                        (REFRESH_INTERVAL, 436, 220, 56, 32),
+                        (INTERVAL_UNIT, 496, 220, 40, 32),
                     ] {
                         let y = y - self.scroll;
                         self.place(get(id), x, y, w, h, 0);
@@ -1374,7 +1479,7 @@ impl App {
                 }
                 match self.page {
                     Page::Main => {
-                        self.place(row.model, 64, y + 6, 140, 40, 1);
+                        self.place(row.model, 64, y + 3, 150, 26, 1);
                         self.place(row.percent, 366, y + 2, 88, 44, 2);
                         self.place(row.refresh, 460, y + 7, 82, 36, 0);
                     }
@@ -1593,7 +1698,11 @@ impl App {
                         extra.push(h);
                     }
                 }
-                let mut text = wide(&state.descriptor.name);
+                let mut text = wide(&format!(
+                    "{} · {}",
+                    state.descriptor.name,
+                    state.descriptor.connection.label()
+                ));
                 let tooltip = CreateWindowExW(
                     WS_EX_TOPMOST,
                     wide("tooltips_class32").as_ptr(),
@@ -1750,6 +1859,12 @@ impl App {
                             startup::status().is_ok_and(|s| s.enabled),
                         ),
                         (ALERTS, "低电提醒", self.manager.notifications_enabled),
+                        (
+                            CONNECTIONS,
+                            "连接提示",
+                            self.manager.connection_notifications,
+                        ),
+                        (AUTO_REFRESH, "自动刷新", self.manager.auto_refresh),
                     ] {
                         let h = add("BUTTON", label, WS_TABSTOP | BS_AUTOCHECKBOX as u32, id);
                         style_control(h, true);
@@ -1765,6 +1880,21 @@ impl App {
                     SendMessageW(edit, EM_SETLIMITTEXT, 8, 0);
                     EnableWindow(edit, i32::from(self.manager.notifications_enabled));
                     add("STATIC", "%", SS_LEFT | SS_CENTERIMAGE, 114);
+                    add(
+                        "STATIC",
+                        "刷新间隔",
+                        SS_LEFT | SS_CENTERIMAGE,
+                        INTERVAL_LABEL,
+                    );
+                    let interval = add(
+                        "EDIT",
+                        &(self.manager.refresh_seconds / 60).to_string(),
+                        WS_TABSTOP | ES_CENTER as u32 | ES_AUTOHSCROLL as u32,
+                        REFRESH_INTERVAL,
+                    );
+                    SendMessageW(interval, EM_SETLIMITTEXT, 8, 0);
+                    EnableWindow(interval, i32::from(self.manager.auto_refresh));
+                    add("STATIC", "分钟", SS_LEFT | SS_CENTERIMAGE, INTERVAL_UNIT);
                 }
             }
         }
@@ -1773,6 +1903,7 @@ impl App {
         self.cancel_support();
         self.page_scroll[self.page.index()] = self.scroll;
         self.threshold_error = false;
+        self.interval_error = false;
         self.clear_rows();
         self.page = page;
         self.scroll = self.page_scroll[page.index()];
@@ -1923,6 +2054,20 @@ impl App {
                     }
                 }
             }
+            CONNECTIONS => {
+                self.manager.connection_notifications = !self.manager.connection_notifications;
+                self.persist();
+            }
+            AUTO_REFRESH => {
+                self.manager.auto_refresh = !self.manager.auto_refresh;
+                self.persist();
+                unsafe {
+                    EnableWindow(
+                        GetDlgItem(self.panel, REFRESH_INTERVAL as i32),
+                        i32::from(self.manager.auto_refresh),
+                    );
+                }
+            }
             id if (SETTINGS_BASE..ADD_BASE).contains(&id) => {
                 let index = ((id - SETTINGS_BASE) / 3) as usize;
                 let action = (id - SETTINGS_BASE) % 3;
@@ -1976,23 +2121,54 @@ impl App {
             self.update_icons(false);
             self.operation_error(&format!("无法保存设置：{error}"));
         }
+        self.apply_refresh_timer();
         self.sync_preferences();
         self.publish_view();
+    }
+    /// The refresh cadence is owned by the tray window timer, so every settings
+    /// change has to restate it. Disabling the setting stops the periodic pass
+    /// entirely instead of leaving a hidden timer running.
+    fn apply_refresh_timer(&self) -> bool {
+        if self.hwnd.is_null() {
+            return false;
+        }
+        unsafe {
+            KillTimer(self.hwnd, 1);
+            if !self.manager.auto_refresh {
+                return true;
+            }
+            let millis = self
+                .manager
+                .refresh_seconds
+                .saturating_mul(1000)
+                .max(30_000);
+            SetTimer(self.hwnd, 1, millis, None) != 0
+        }
     }
     fn sync_preferences(&self) {
         if self.panel.is_null() || self.page != Page::Settings {
             return;
         }
         unsafe {
-            SendMessageW(
-                GetDlgItem(self.panel, ALERTS as i32),
-                BM_SETCHECK,
-                usize::from(self.manager.notifications_enabled),
-                0,
-            );
+            for (id, checked) in [
+                (ALERTS, self.manager.notifications_enabled),
+                (CONNECTIONS, self.manager.connection_notifications),
+                (AUTO_REFRESH, self.manager.auto_refresh),
+            ] {
+                SendMessageW(
+                    GetDlgItem(self.panel, id as i32),
+                    BM_SETCHECK,
+                    usize::from(checked),
+                    0,
+                );
+            }
             EnableWindow(
                 GetDlgItem(self.panel, THRESHOLD as i32),
                 i32::from(self.manager.notifications_enabled),
+            );
+            EnableWindow(
+                GetDlgItem(self.panel, REFRESH_INTERVAL as i32),
+                i32::from(self.manager.auto_refresh),
             );
             for row in &self.rows {
                 if let Some(state) = self
@@ -2046,8 +2222,10 @@ impl App {
                 if self.page == Page::Settings {
                     match unsafe { GetDlgCtrlID(hwnd) } as u32 {
                         STARTUP => Some((4, 40)),
-                        ALERTS => Some((52, 40)),
+                        ALERTS | CONNECTIONS => Some((52, 40)),
                         THRESHOLD => Some((104, 32)),
+                        AUTO_REFRESH => Some((152, 40)),
+                        REFRESH_INTERVAL => Some((156, 32)),
                         _ => None,
                     }
                 } else {
@@ -2158,19 +2336,84 @@ impl App {
         }
         self.publish_view();
     }
+    fn submit_refresh_interval(&mut self, enter: bool) {
+        if self.page != Page::Settings {
+            return;
+        }
+        unsafe {
+            let edit = GetDlgItem(self.panel, REFRESH_INTERVAL as i32);
+            let mut text = [0u16; 32];
+            let len = GetWindowTextW(edit, text.as_mut_ptr(), 32);
+            let text = String::from_utf16_lossy(&text[..len as usize]);
+            let parsed = if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+                text.parse::<u32>()
+                    .ok()
+                    .filter(|n| manager::REFRESH_MINUTES.contains(n))
+            } else {
+                None
+            };
+            if let Some(minutes) = parsed {
+                let previous = self.manager.refresh_seconds;
+                self.manager.refresh_seconds = minutes * 60;
+                self.interval_error = false;
+                SendMessageW(edit, EM_HIDEBALLOONTIP, 0, 0);
+                self.persist();
+                if let Some(error) = &self.manager.persistence_error {
+                    self.manager.refresh_seconds = previous;
+                    SetWindowTextW(edit, wide(&(previous / 60).to_string()).as_ptr());
+                    self.operation_error(&format!("无法保存刷新间隔：{error}"));
+                }
+            } else {
+                self.interval_error = true;
+                if enter {
+                    SendMessageW(edit, EM_SETSEL, 0, -1);
+                } else {
+                    SetWindowTextW(
+                        edit,
+                        wide(&(self.manager.refresh_seconds / 60).to_string()).as_ptr(),
+                    );
+                }
+                if !cfg!(test) {
+                    let title = wide("刷新间隔");
+                    let message = wide("请输入1–60的整数（分钟）");
+                    let tip = EDITBALLOONTIP {
+                        cbStruct: std::mem::size_of::<EDITBALLOONTIP>() as u32,
+                        pszTitle: title.as_ptr(),
+                        pszText: message.as_ptr(),
+                        ttiIcon: TTI_ERROR,
+                    };
+                    SendMessageW(
+                        edit,
+                        EM_SHOWBALLOONTIP,
+                        0,
+                        &tip as *const EDITBALLOONTIP as isize,
+                    );
+                    windows_sys::Win32::UI::Accessibility::NotifyWinEvent(
+                        EVENT_SYSTEM_ALERT,
+                        edit,
+                        OBJID_CLIENT,
+                        0,
+                    );
+                }
+            }
+            InvalidateRect(self.panel, null(), 1);
+        }
+        self.apply_refresh_timer();
+        self.publish_view();
+    }
     fn process_events(&mut self) {
         while let Some(event) = self.bridge.next() {
             match event {
                 UiEvent::Control(command) => match command {
-                    REFRESH => self.refresh(),
+                    REFRESH => self.refresh(true),
                     QUIT => self.quit(),
                     SIMULATE_ERROR => {
                         self.simulated = true;
-                        self.refresh();
+                        self.refresh(true);
                     }
                     RECOVER => {
                         self.simulated = false;
-                        self.refresh();
+                        self.refresh(true);
                     }
                     EXPLORER_RESTART => {
                         self.remove_icons();
@@ -2198,15 +2441,18 @@ impl App {
                         self.persist();
                         self.deliver_alerts();
                     }
+                    if !self.manager.pending_connections.is_empty() {
+                        self.deliver_connections();
+                    }
                     self.publish_view();
                 }
-                UiEvent::Refresh => self.refresh(),
+                UiEvent::Refresh => self.refresh(true),
                 UiEvent::Discover => self.discover(),
                 UiEvent::Activity => {
                     self.bridge.activity_queued.set(false);
                     if self.last_activity_refresh.elapsed().as_secs() >= 10 {
                         self.last_activity_refresh = Instant::now();
-                        self.refresh();
+                        self.refresh(false);
                     }
                 }
                 UiEvent::Menu(requested, id) => self.show_menu(requested, id, false),
@@ -2215,6 +2461,11 @@ impl App {
                 UiEvent::Threshold(enter) => self.submit_threshold(enter),
                 UiEvent::ThresholdEdited => {
                     self.threshold_error = false;
+                    self.publish_view();
+                }
+                UiEvent::Interval(enter) => self.submit_refresh_interval(enter),
+                UiEvent::IntervalEdited => {
+                    self.interval_error = false;
                     self.publish_view();
                 }
                 UiEvent::ShowPanel => self.show_panel(),
@@ -3045,21 +3296,26 @@ unsafe extern "system" fn panel_proc(
             let dpi = unsafe { GetDpiForWindow(hwnd).max(96) as i32 };
             let x = (lparam as i16) as i32;
             let y = ((lparam >> 16) as i16) as i32;
-            if page == Page::Settings
-                && x >= 464 * dpi / 96
-                && x < 520 * dpi / 96
-                && y >= (168 - scroll) * dpi / 96
-                && y < (200 - scroll) * dpi / 96
-            {
-                // Keep the original full-height click target around the
-                // shorter text field; never focus a disabled threshold.
-                unsafe {
-                    let edit = GetDlgItem(hwnd, THRESHOLD as i32);
-                    if IsWindowEnabled(edit) != 0 {
-                        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(edit);
+            // Keep the original full-height click target around each shorter
+            // text field; never focus a disabled one.
+            for (id, left, right, top, bottom) in [
+                (THRESHOLD, 464, 520, 168, 200),
+                (REFRESH_INTERVAL, 436, 492, 220, 252),
+            ] {
+                if page == Page::Settings
+                    && x >= left * dpi / 96
+                    && x < right * dpi / 96
+                    && y >= (top - scroll) * dpi / 96
+                    && y < (bottom - scroll) * dpi / 96
+                {
+                    unsafe {
+                        let edit = GetDlgItem(hwnd, id as i32);
+                        if IsWindowEnabled(edit) != 0 {
+                            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(edit);
+                        }
                     }
+                    return 0;
                 }
-                return 0;
             }
             return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
         }
@@ -3081,7 +3337,7 @@ unsafe extern "system" fn panel_proc(
                 };
                 UiEvent::DeviceCommand(view.page, action, row.descriptor.id.clone())
             }
-            BACK | STARTUP | ALERTS | PICK_REFRESH => {
+            BACK | STARTUP | ALERTS | CONNECTIONS | AUTO_REFRESH | PICK_REFRESH => {
                 UiEvent::PageCommand((wparam & 0xffff) as u32)
             }
             id if id >= ROW_BASE && (id - ROW_BASE) % 3 == 2 => {
@@ -3094,7 +3350,8 @@ unsafe extern "system" fn panel_proc(
             _ => return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
         },
         WM_COMMAND
-            if (wparam & 0xffff) as u32 == THRESHOLD && (wparam >> 16) as u32 == EN_SETFOCUS =>
+            if matches!((wparam & 0xffff) as u32, THRESHOLD | REFRESH_INTERVAL)
+                && (wparam >> 16) as u32 == EN_SETFOCUS =>
         {
             unsafe {
                 InvalidateRect(hwnd, null(), 1);
@@ -3102,18 +3359,28 @@ unsafe extern "system" fn panel_proc(
             return 0;
         }
         WM_COMMAND
-            if (wparam & 0xffff) as u32 == THRESHOLD && (wparam >> 16) as u32 == EN_KILLFOCUS =>
+            if matches!((wparam & 0xffff) as u32, THRESHOLD | REFRESH_INTERVAL)
+                && (wparam >> 16) as u32 == EN_KILLFOCUS =>
         {
-            UiEvent::Threshold(false)
+            if (wparam & 0xffff) as u32 == THRESHOLD {
+                UiEvent::Threshold(false)
+            } else {
+                UiEvent::Interval(false)
+            }
         }
         WM_COMMAND
-            if (wparam & 0xffff) as u32 == THRESHOLD && (wparam >> 16) as u32 == EN_CHANGE =>
+            if matches!((wparam & 0xffff) as u32, THRESHOLD | REFRESH_INTERVAL)
+                && (wparam >> 16) as u32 == EN_CHANGE =>
         {
             unsafe {
                 SendMessageW(lparam as HWND, EM_HIDEBALLOONTIP, 0, 0);
                 InvalidateRect(hwnd, null(), 1);
             }
-            UiEvent::ThresholdEdited
+            if (wparam & 0xffff) as u32 == THRESHOLD {
+                UiEvent::ThresholdEdited
+            } else {
+                UiEvent::IntervalEdited
+            }
         }
         WM_VSCROLL => UiEvent::Scroll(match (wparam & 0xffff) as i32 {
             SB_LINEUP => -64,
@@ -3267,24 +3534,29 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
             let clip = SaveDC(dc);
             IntersectClipRect(dc, 0, 64, 560, height - 24);
             let offset = view.scroll;
-            let edit = GetDlgItem(hwnd, THRESHOLD as i32);
-            let focused = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == edit;
-            SetDCBrushColor(dc, colors.paper);
-            SetDCPenColor(
-                dc,
-                if (focused && focus_cues_visible(edit)) || view.threshold_error {
-                    colors.fill
-                } else {
-                    colors.outline
-                },
-            );
-            SelectObject(dc, GetStockObject(NULL_BRUSH));
-            RoundRect(dc, 462, 167 - offset, 538, 201 - offset, 5, 5);
-            SelectObject(dc, GetStockObject(DC_BRUSH));
+            for (id, left, top, right, bottom, error) in [
+                (THRESHOLD, 462, 167, 538, 201, view.threshold_error),
+                (REFRESH_INTERVAL, 434, 219, 538, 253, view.interval_error),
+            ] {
+                let edit = GetDlgItem(hwnd, id as i32);
+                let focused = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == edit;
+                SetDCBrushColor(dc, colors.paper);
+                SetDCPenColor(
+                    dc,
+                    if (focused && focus_cues_visible(edit)) || error {
+                        colors.fill
+                    } else {
+                        colors.outline
+                    },
+                );
+                SelectObject(dc, GetStockObject(NULL_BRUSH));
+                RoundRect(dc, left, top - offset, right, bottom - offset, 5, 5);
+                SelectObject(dc, GetStockObject(DC_BRUSH));
+            }
             if !view.rows.is_empty() {
                 SetDCPenColor(dc, colors.empty);
-                MoveToEx(dc, 24, 218 - offset, null_mut());
-                LineTo(dc, 536, 218 - offset);
+                MoveToEx(dc, 24, 274 - offset, null_mut());
+                LineTo(dc, 536, 274 - offset);
                 SetTextColor(dc, colors.secondary);
                 for (text, left, right) in
                     [("设备", 24, 300), ("托盘", 334, 380), ("提醒", 410, 458)]
@@ -3294,9 +3566,9 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
                         text,
                         RECT {
                             left,
-                            top: 228 - offset,
+                            top: 284 - offset,
                             right,
-                            bottom: 254 - offset,
+                            bottom: 310 - offset,
                         },
                         13,
                         400,
@@ -3322,9 +3594,25 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
                 DT_CENTER | DT_VCENTER,
             );
         }
+        if view.page == Page::Main && view.rows.is_empty() {
+            SetTextColor(dc, colors.secondary);
+            panel_text(
+                dc,
+                "暂无已连接的设备",
+                RECT {
+                    left: 24,
+                    top: 62,
+                    right: 536,
+                    bottom: 88,
+                },
+                13,
+                400,
+                DT_CENTER | DT_VCENTER,
+            );
+        }
         let top = match view.page {
             Page::Main => 20,
-            Page::Settings => 264,
+            Page::Settings => 320,
             Page::Add => 76,
         };
         let footer = if view.page == Page::Main { 48 } else { 24 };
@@ -3351,6 +3639,20 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
             }
             if view.page == Page::Main {
                 draw_battery(dc, y, state.reading.as_ref(), &colors);
+                SetTextColor(dc, colors.secondary);
+                panel_text(
+                    dc,
+                    &row_detail(state),
+                    RECT {
+                        left: 64,
+                        top: y + 27,
+                        right: 240,
+                        bottom: y + 47,
+                    },
+                    12,
+                    400,
+                    DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS,
+                );
             }
             if view.page != Page::Settings && index + 1 < view.rows.len() {
                 SetDCPenColor(dc, colors.empty);
@@ -3600,7 +3902,7 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             refresh_count: 0,
             success_count: 0,
             bridge: bridge.clone(),
-            panel_fonts: [null_mut(); 3],
+            panel_fonts: [null_mut(); 4],
             panel_icons: [null_mut(); 2],
             last_activity_refresh: Instant::now() - std::time::Duration::from_secs(10),
             picker_ids: Vec::new(),
@@ -3608,6 +3910,7 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             page_scroll: [0; 3],
             page_controls: Vec::new(),
             threshold_error: false,
+            interval_error: false,
             notification_submissions: 0,
             notification_last_accepted: false,
             scroll: 0,
@@ -3631,7 +3934,7 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             2,
             std::mem::size_of::<RAWINPUTDEVICE>() as u32,
         );
-        if SetTimer(hwnd, 1, 120_000, None) == 0 || SetTimer(hwnd, 2, 30_000, None) == 0 {
+        if SetTimer(hwnd, 2, 30_000, None) == 0 || !app.apply_refresh_timer() {
             app.quit();
             return Err("无法启动刷新定时器".into());
         }
@@ -3673,9 +3976,16 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             if message.message == WM_KEYDOWN
                 && message.wParam == 13
                 && !app.panel.is_null()
-                && GetDlgCtrlID(message.hwnd) as u32 == THRESHOLD
+                && matches!(
+                    GetDlgCtrlID(message.hwnd) as u32,
+                    THRESHOLD | REFRESH_INTERVAL
+                )
             {
-                app.submit_threshold(true);
+                if GetDlgCtrlID(message.hwnd) as u32 == THRESHOLD {
+                    app.submit_threshold(true);
+                } else {
+                    app.submit_refresh_interval(true);
+                }
                 app.process_events();
                 continue;
             }
@@ -4269,7 +4579,7 @@ mod tests {
                 refresh_count: 0,
                 success_count: 0,
                 bridge: test_bridge(),
-                panel_fonts: [null_mut(); 3],
+                panel_fonts: [null_mut(); 4],
                 panel_icons: [null_mut(); 2],
                 last_activity_refresh: Instant::now(),
                 picker_ids: Vec::new(),
@@ -4277,6 +4587,7 @@ mod tests {
                 page_scroll: [0; 3],
                 page_controls: Vec::new(),
                 threshold_error: false,
+                interval_error: false,
                 notification_submissions: 0,
                 notification_last_accepted: false,
                 scroll: 0,
@@ -4298,6 +4609,7 @@ mod tests {
                     kind: DeviceKind::Mouse,
                     supported: false,
                     provider: "unsupported".into(),
+                    connection: crate::device::Connection::Unknown,
                 },
                 reading: Some(
                     Reading::from_percent(
@@ -4389,6 +4701,7 @@ mod tests {
                         kind: DeviceKind::Mouse,
                         supported: true,
                         provider: "fixture".into(),
+                        connection: crate::device::Connection::Receiver,
                     },
                     reading: Some(
                         Reading::from_percent(
@@ -4926,7 +5239,7 @@ mod tests {
                 refresh_count: 0,
                 success_count: 0,
                 bridge: test_bridge(),
-                panel_fonts: [null_mut(); 3],
+                panel_fonts: [null_mut(); 4],
                 panel_icons: [null_mut(); 2],
                 last_activity_refresh: Instant::now(),
                 picker_ids: Vec::new(),
@@ -4934,6 +5247,7 @@ mod tests {
                 page_scroll: [0; 3],
                 page_controls: Vec::new(),
                 threshold_error: false,
+                interval_error: false,
                 notification_submissions: 0,
                 notification_last_accepted: false,
                 scroll: 0,
@@ -4953,6 +5267,7 @@ mod tests {
                         kind,
                         supported,
                         provider: "fixture".into(),
+                        connection: crate::device::Connection::Receiver,
                     },
                     selected: id == "mouse",
                     removed: false,
@@ -5015,7 +5330,10 @@ mod tests {
             assert_eq!(window_text(app.rows[0].model), "Renamed mouse");
             assert!(window_text(app.rows[0].refresh).contains("Renamed mouse，低电提醒"));
             assert_eq!(app.rows[0].presentation.2, DeviceKind::Headset);
-            assert_eq!(app.rows[0]._tooltip_text, wide("Renamed mouse"));
+            assert_eq!(
+                app.rows[0]._tooltip_text,
+                wide("Renamed mouse · 2.4G 接收器")
+            );
             assert_eq!(app.resolve_anchor(&anchor).unwrap().0, app.rows[0].refresh);
             assert!(app.anchor_for(null_mut()).is_none());
             let foreign = CreateWindowExW(
@@ -5069,6 +5387,8 @@ mod tests {
                 high_contrast: true,
             };
             draw_control_colors(app.rows[0].percent, true, dc, &high_contrast);
+            let mut bb: RECT = std::mem::zeroed();
+            GetClientRect(app.rows[0].percent, &mut bb);
             assert_eq!(GetPixel(dc, 4, 18), high_contrast.fill);
             assert_eq!(window_text(app.rows[0].percent), "Renamed mouse，显示托盘");
             SelectObject(dc, old);
@@ -5151,6 +5471,149 @@ mod tests {
         }
     }
     #[test]
+    fn row_detail_shows_link_state_and_reading_age() {
+        let mut state = crate::manager::DeviceState {
+            descriptor: crate::device::DeviceDescriptor {
+                id: "detail".into(),
+                physical_id: "detail".into(),
+                endpoint: None,
+                recoverable: true,
+                name: "Detail".into(),
+                kind: DeviceKind::Mouse,
+                supported: true,
+                provider: "fixture".into(),
+                connection: crate::device::Connection::Receiver,
+            },
+            selected: true,
+            removed: false,
+            show_tray: true,
+            notify: true,
+            alert: crate::notifications::AlertRecord::default(),
+            reading: None,
+            last_success: None,
+            error: None,
+            connected: false,
+            connection_known: false,
+        };
+        // Before the first discovery the link is genuinely unknown, never "down".
+        assert_eq!(row_detail(&state), "2.4G · 连接状态未知");
+        state.connection_known = true;
+        assert_eq!(row_detail(&state), "2.4G · 未连接");
+        state.connected = true;
+        assert_eq!(row_detail(&state), "2.4G · 尚未读取");
+        for (age, expected) in [
+            (0u64, "2.4G · 刚刚更新"),
+            (61, "2.4G · 1 分钟前"),
+            (7_200, "2.4G · 2 小时前"),
+            (180_000, "2.4G · 2 天前"),
+        ] {
+            state.last_success = Some(now().saturating_sub(age));
+            assert_eq!(row_detail(&state), expected);
+        }
+        state.descriptor.connection = crate::device::Connection::BluetoothClassic;
+        assert!(row_detail(&state).starts_with("蓝牙 · "));
+    }
+    #[test]
+    fn auto_refresh_setting_gates_its_interval_and_rejects_bad_minutes() {
+        unsafe {
+            let mut manager = Manager::default();
+            manager.merge(
+                vec![Candidate {
+                    descriptor: crate::device::DeviceDescriptor {
+                        id: "mouse".into(),
+                        physical_id: "mouse".into(),
+                        endpoint: Some("1".into()),
+                        recoverable: true,
+                        name: "Settings mouse".into(),
+                        kind: DeviceKind::Mouse,
+                        supported: true,
+                        provider: "fixture".into(),
+                        connection: crate::device::Connection::Receiver,
+                    },
+                    reading: Some(
+                        Reading::from_percent(
+                            "Settings mouse".into(),
+                            65,
+                            crate::device::PowerState::Discharging,
+                        )
+                        .unwrap(),
+                    ),
+                    error: None,
+                }],
+                100,
+            );
+            let (mut app, _) = headless_app(manager);
+            let window = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                560,
+                600,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!window.is_null());
+            attach_bridge(window, &app.bridge);
+            app.panel = window;
+            app.page = Page::Settings;
+            app.create_page_controls();
+            app.rebuild_rows();
+            let interval = GetDlgItem(window, REFRESH_INTERVAL as i32);
+            assert_eq!(window_text(interval), "2");
+            assert_ne!(IsWindowEnabled(interval), 0);
+            assert_eq!(
+                SendMessageW(GetDlgItem(window, AUTO_REFRESH as i32), BM_GETCHECK, 0, 0),
+                1
+            );
+            // Turning the setting off disables its interval field and vice versa.
+            app.page_command(AUTO_REFRESH);
+            assert!(!app.manager.auto_refresh);
+            assert_eq!(IsWindowEnabled(interval), 0);
+            assert_eq!(
+                SendMessageW(GetDlgItem(window, AUTO_REFRESH as i32), BM_GETCHECK, 0, 0),
+                0
+            );
+            app.page_command(AUTO_REFRESH);
+            assert!(app.manager.auto_refresh);
+            assert_ne!(IsWindowEnabled(interval), 0);
+            // The connection switch is independent of the low-battery one.
+            app.page_command(CONNECTIONS);
+            assert!(!app.manager.connection_notifications);
+            app.page_command(CONNECTIONS);
+            assert!(app.manager.connection_notifications);
+            for (typed, seconds, error) in [
+                ("0", 120, true),
+                ("61", 120, true),
+                ("bad", 120, true),
+                ("", 120, true),
+                ("1", 60, false),
+                ("5", 300, false),
+            ] {
+                SetWindowTextW(interval, wide(typed).as_ptr());
+                app.submit_refresh_interval(true);
+                assert_eq!(app.manager.refresh_seconds, seconds, "typed {typed}");
+                assert_eq!(app.interval_error, error, "typed {typed}");
+            }
+            // A confirmed value clears the error and resets the timer.
+            app.submit_refresh_interval(false);
+            assert_eq!(app.manager.refresh_seconds, 300);
+            assert!(!app.interval_error);
+            hidden_native_bitmap(window, "settings-refresh-fixture");
+            // The row shows the link type and reading age on the main page.
+            app.switch_page(Page::Main);
+            assert_eq!(app.rows.len(), 1);
+            hidden_native_bitmap(window, "main-connection-fixture");
+            release_window_bridge(window);
+            assert_ne!(DestroyWindow(window), 0);
+            let _ = std::fs::remove_file(manager::state_path());
+        }
+    }
+    #[test]
     fn simulation_covers_pending_discovery_and_inflight_real_results() {
         let (sender, commands) = mpsc::channel();
         let (results, receiver) = mpsc::channel();
@@ -5165,6 +5628,7 @@ mod tests {
             kind: DeviceKind::Mouse,
             supported: true,
             provider: "fixture".into(),
+            connection: crate::device::Connection::Receiver,
         };
         manager.merge(
             vec![Candidate {
@@ -5205,7 +5669,7 @@ mod tests {
             refresh_count: 0,
             success_count: 0,
             bridge,
-            panel_fonts: [null_mut(); 3],
+            panel_fonts: [null_mut(); 4],
             panel_icons: [null_mut(); 2],
             last_activity_refresh: Instant::now(),
             picker_ids: Vec::new(),
@@ -5213,6 +5677,7 @@ mod tests {
             page_scroll: [0; 3],
             page_controls: Vec::new(),
             threshold_error: false,
+            interval_error: false,
             notification_submissions: 0,
             notification_last_accepted: false,
             scroll: 0,

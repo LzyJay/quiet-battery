@@ -64,12 +64,6 @@ impl AlertRecord {
 /// Quiet-time-aware Shell notification. Windows owns presentation and suppression.
 /// Never substitutes a modal dialog if the user/system suppresses notifications.
 pub fn show(hwnd: HWND, shell_id: u32, model: &str, percent: u8, self_test: bool) -> bool {
-    let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
-    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    data.hWnd = hwnd;
-    data.uID = shell_id;
-    data.uFlags = NIF_INFO;
-    data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
     let title = if self_test {
         "Quiet Battery 通知自测"
     } else {
@@ -80,6 +74,36 @@ pub fn show(hwnd: HWND, shell_id: u32, model: &str, percent: u8, self_test: bool
     } else {
         format!("{model} · {percent}%")
     };
+    shell_info(hwnd, shell_id, title, &message)
+}
+
+/// Confirmed link transition on the same Shell channel as the battery alert.
+pub fn show_connection(
+    hwnd: HWND,
+    shell_id: u32,
+    model: &str,
+    connected: bool,
+    percent: Option<u8>,
+) -> bool {
+    let title = if connected {
+        "设备已连接"
+    } else {
+        "设备已断开"
+    };
+    let message = match (connected, percent) {
+        (true, Some(value)) => format!("{model} · {value}%"),
+        _ => model.to_owned(),
+    };
+    shell_info(hwnd, shell_id, title, &message)
+}
+
+fn shell_info(hwnd: HWND, shell_id: u32, title: &str, message: &str) -> bool {
+    let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    data.hWnd = hwnd;
+    data.uID = shell_id;
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
     for (dst, src) in data
         .szInfoTitle
         .iter_mut()

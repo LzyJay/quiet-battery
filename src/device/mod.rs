@@ -98,6 +98,55 @@ impl DeviceKind {
         Self::ALL.into_iter().find(|kind| kind.key() == key)
     }
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Connection {
+    /// The adapter found the device but has no evidence for the physical link.
+    #[default]
+    Unknown,
+    /// A 2.4G USB receiver, reported by the adapter profile that matched it.
+    Receiver,
+    /// Classic Bluetooth link (BR/EDR), e.g. an HFP audio gateway.
+    BluetoothClassic,
+    /// Bluetooth Low Energy link.
+    BluetoothLe,
+    /// Physically wired USB with a matching cable profile.
+    Cable,
+    /// Direct HID++ endpoint that the protocol cannot classify as cable or radio.
+    Direct,
+}
+impl Connection {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Receiver => "receiver",
+            Self::BluetoothClassic => "bluetooth",
+            Self::BluetoothLe => "bluetooth-le",
+            Self::Cable => "cable",
+            Self::Direct => "direct",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "连接方式未知",
+            Self::Receiver => "2.4G 接收器",
+            Self::BluetoothClassic => "蓝牙",
+            Self::BluetoothLe => "蓝牙 LE",
+            Self::Cable => "USB 有线",
+            Self::Direct => "USB 直连",
+        }
+    }
+    /// Compact form for the device row's second line.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Unknown => "未知",
+            Self::Receiver => "2.4G",
+            Self::BluetoothClassic => "蓝牙",
+            Self::BluetoothLe => "蓝牙 LE",
+            Self::Cable => "有线",
+            Self::Direct => "直连",
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceDescriptor {
     pub id: String,
@@ -108,6 +157,8 @@ pub struct DeviceDescriptor {
     pub kind: DeviceKind,
     pub supported: bool,
     pub provider: String,
+    /// Link type proven by the adapter profile; never guessed from the name.
+    pub connection: Connection,
 }
 impl DeviceDescriptor {
     pub fn short_name(&self) -> String {

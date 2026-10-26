@@ -635,6 +635,7 @@ fn discover_service(
             kind: category,
             supported: true,
             provider: "bas".into(),
+            connection: super::Connection::BluetoothLe,
         },
         reading,
         error,
@@ -1139,6 +1140,7 @@ mod tests {
                 kind: DeviceKind::Mouse,
                 supported: true,
                 provider: "bas".into(),
+                connection: super::Connection::BluetoothLe,
             },
             reading: Some(
                 Reading::from_percent(id.into(), percent, PowerState::Unknown(255)).unwrap(),

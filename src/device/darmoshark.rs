@@ -72,6 +72,8 @@ fn descriptor(c: &Collection) -> DeviceDescriptor {
         kind: DeviceKind::Mouse,
         supported: true,
         provider: "darmoshark".into(),
+        // The claimed endpoint is the 248A:FF30 2.4G receiver.
+        connection: super::Connection::Receiver,
     }
 }
 fn reply(raw: &[u8], command: u8, minimum: usize) -> Result<&[u8], DeviceError> {

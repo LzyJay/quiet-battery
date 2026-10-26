@@ -2,8 +2,8 @@
 #[cfg(test)]
 use crate::device::Candidate;
 use crate::device::{
-    BatterySource, DeviceDescriptor, DeviceError, DeviceKind, DiscoveryReport, PowerState, Reading,
-    level_for,
+    BatterySource, Connection, DeviceDescriptor, DeviceError, DeviceKind, DiscoveryReport,
+    PowerState, Reading, level_for,
 };
 use crate::notifications::AlertRecord;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,18 @@ pub struct Manager {
     pub devices: Vec<DeviceState>,
     pub notifications_enabled: bool,
     pub threshold: u8,
+    /// Periodic background refresh of battery values.
+    pub auto_refresh: bool,
+    /// Seconds between automatic refreshes when `auto_refresh` is set.
+    pub refresh_seconds: u32,
+    /// Shell toast for confirmed link up/down transitions.
+    pub connection_notifications: bool,
     pub pending_alerts: Vec<(String, String, u8)>,
+    /// Confirmed link transitions: device id and the new state.
+    pub pending_connections: Vec<(String, bool)>,
+    /// False until the first discovery has established a baseline, so starting
+    /// the app never announces every already-connected device.
+    pub connection_baseline: bool,
     pub persistence_error: Option<String>,
     pub discovery_errors: Vec<(String, String)>,
 }
@@ -36,19 +47,33 @@ impl Default for Manager {
             devices: Vec::new(),
             notifications_enabled: true,
             threshold: 20,
+            auto_refresh: true,
+            refresh_seconds: DEFAULT_REFRESH_SECONDS,
+            connection_notifications: true,
             pending_alerts: Vec::new(),
+            pending_connections: Vec::new(),
+            connection_baseline: false,
             persistence_error: None,
             discovery_errors: Vec::new(),
         }
     }
 }
+/// Two minutes: the historical cadence before the setting existed.
+pub const DEFAULT_REFRESH_SECONDS: u32 = 120;
+/// Bounds accepted from the settings field, in minutes.
+pub const REFRESH_MINUTES: std::ops::RangeInclusive<u32> = 1..=60;
 impl Manager {
     pub fn load(path: &Path) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 if !matches!(
                     text.lines().next(),
-                    Some("QuietBattery\t4" | "QuietBattery\t5" | "QuietBattery\t6")
+                    Some(
+                        "QuietBattery\t4"
+                            | "QuietBattery\t5"
+                            | "QuietBattery\t6"
+                            | "QuietBattery\t7"
+                    )
                 ) {
                     return Err("设置文件格式无法识别，原文件未修改".into());
                 }
@@ -78,6 +103,11 @@ impl Manager {
     pub fn merge_discovery(&mut self, report: DiscoveryReport, timestamp: u64) {
         self.discovery_errors = report.failures;
         let candidates = report.candidates;
+        let before: Vec<(String, bool, bool)> = self
+            .devices
+            .iter()
+            .map(|s| (s.descriptor.id.clone(), s.connected, s.connection_known))
+            .collect();
         let seen: std::collections::BTreeSet<_> =
             candidates.iter().map(|c| c.descriptor.id.clone()).collect();
         for state in &mut self.devices {
@@ -202,6 +232,28 @@ impl Manager {
                 || state.reading.is_some()
                 || !state.show_tray
         });
+        self.record_connections(&before);
+    }
+    /// Link transitions are only reported once the previous state was confirmed.
+    /// Discovery updates several flags per pass, so the whole merge is compared
+    /// against one snapshot instead of intermediate values.
+    fn record_connections(&mut self, before: &[(String, bool, bool)]) {
+        let first_pass = !self.connection_baseline;
+        self.connection_baseline = true;
+        if first_pass || !self.connection_notifications {
+            return;
+        }
+        for state in self.devices.iter().filter(|s| s.selected && !s.removed) {
+            let Some((_, was, known)) = before.iter().find(|(id, _, _)| *id == state.descriptor.id)
+            else {
+                // First sighting of a device is not a reconnect.
+                continue;
+            };
+            if *known && state.connection_known && *was != state.connected {
+                self.pending_connections
+                    .push((state.descriptor.id.clone(), state.connected));
+            }
+        }
     }
     pub fn display_name(&self, id: &str, short: bool) -> String {
         let Some(state) = self.devices.iter().find(|s| s.descriptor.id == id) else {
@@ -293,9 +345,12 @@ impl Manager {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let mut text = format!(
-            "QuietBattery\t6\npreferences\t{}\t{}\n",
+            "QuietBattery\t7\npreferences\t{}\t{}\t{}\t{}\t{}\n",
             u8::from(self.notifications_enabled),
-            self.threshold
+            self.threshold,
+            u8::from(self.auto_refresh),
+            self.refresh_seconds,
+            u8::from(self.connection_notifications)
         );
         for state in &self.devices {
             // Only user choices and successful data are durable; enumeration-only
@@ -346,13 +401,33 @@ impl Manager {
             Some("QuietBattery\t4") => 4,
             Some("QuietBattery\t5") => 5,
             Some("QuietBattery\t6") => 6,
+            Some("QuietBattery\t7") => 7,
             _ => return manager,
         };
         let mut device_records = 0;
         for line in lines.take(1024) {
             let fields: Vec<_> = line.split('\t').collect();
-            if version == 6 && fields.first() == Some(&"preferences") {
-                if fields.len() == 3
+            if fields.first() == Some(&"preferences") {
+                if version == 7 {
+                    if fields.len() == 6
+                        && matches!(fields[1], "0" | "1")
+                        && fields[2]
+                            .parse::<u8>()
+                            .is_ok_and(|n| (1..=100).contains(&n))
+                        && matches!(fields[3], "0" | "1")
+                        && fields[4].parse::<u32>().is_ok_and(|n| {
+                            (REFRESH_MINUTES.start() * 60..=REFRESH_MINUTES.end() * 60).contains(&n)
+                        })
+                        && matches!(fields[5], "0" | "1")
+                    {
+                        manager.notifications_enabled = fields[1] == "1";
+                        manager.threshold = fields[2].parse().unwrap();
+                        manager.auto_refresh = fields[3] == "1";
+                        manager.refresh_seconds = fields[4].parse().unwrap();
+                        manager.connection_notifications = fields[5] == "1";
+                    }
+                } else if version == 6
+                    && fields.len() == 3
                     && matches!(fields[1], "0" | "1")
                     && fields[2]
                         .parse::<u8>()
@@ -478,6 +553,9 @@ impl Manager {
                     kind,
                     supported: flags[3],
                     provider: fields[10].to_owned(),
+                    // The link type is adapter evidence, not a persisted choice.
+                    // The next discovery repopulates it for present devices.
+                    connection: Connection::Unknown,
                     endpoint: if version == 4 || fields[12] == "-" {
                         None
                     } else {
@@ -683,6 +761,7 @@ mod tests {
                 kind,
                 supported,
                 provider: "fixture".into(),
+                connection: Connection::Receiver,
             },
             reading: supported.then_some(Reading::from_levels("Peripheral".into(), 3, 4).unwrap()),
             error: None,
@@ -916,6 +995,86 @@ mod tests {
             m.devices[1].reading.as_ref().unwrap().normalized_percent(),
             25
         );
+    }
+    #[test]
+    fn link_transitions_need_a_confirmed_previous_state() {
+        let mut manager = Manager::default();
+        // The first discovery is the baseline: an already-present mouse is silent.
+        manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
+        assert!(manager.pending_connections.is_empty());
+        assert!(manager.connection_baseline);
+        // Power-cycling the mouse confirms the link went down, then up again.
+        manager.merge(Vec::new(), 200);
+        assert_eq!(
+            std::mem::take(&mut manager.pending_connections),
+            vec![("mouse".to_owned(), false)]
+        );
+        manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 300);
+        assert_eq!(
+            std::mem::take(&mut manager.pending_connections),
+            vec![("mouse".to_owned(), true)]
+        );
+        // A device appearing for the first time is not a reconnect.
+        let mut fresh = Manager::default();
+        fresh.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
+        fresh.merge(
+            vec![
+                candidate("mouse", DeviceKind::Mouse, true),
+                candidate("late", DeviceKind::Mouse, true),
+            ],
+            200,
+        );
+        assert!(fresh.pending_connections.is_empty());
+    }
+    #[test]
+    fn connection_toasts_follow_their_own_switch_and_opt_out() {
+        let mut manager = Manager::default();
+        manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
+        manager.connection_notifications = false;
+        manager.merge(Vec::new(), 200);
+        assert!(manager.pending_connections.is_empty());
+        manager.connection_notifications = true;
+        // An unmonitored device never announces anything.
+        manager.remove("mouse");
+        manager.merge(Vec::new(), 300);
+        manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 400);
+        assert!(manager.pending_connections.is_empty());
+    }
+    #[test]
+    fn v7_preferences_roundtrip_and_older_files_keep_the_old_cadence() {
+        let mut manager = Manager::default();
+        manager.merge(vec![candidate("opaque", DeviceKind::Mouse, true)], 100);
+        manager.auto_refresh = false;
+        manager.refresh_seconds = 300;
+        manager.connection_notifications = false;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            ".build/tmp/preferences-{}.state",
+            std::process::id()
+        ));
+        manager.save(&path);
+        let restored = Manager::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!restored.auto_refresh);
+        assert_eq!(restored.refresh_seconds, 300);
+        assert!(!restored.connection_notifications);
+        let migrated = Manager::decode("QuietBattery\t6\npreferences\t0\t31\n");
+        assert!(migrated.auto_refresh);
+        assert_eq!(migrated.refresh_seconds, DEFAULT_REFRESH_SECONDS);
+        assert!(migrated.connection_notifications);
+        assert!(!migrated.notifications_enabled);
+        assert_eq!(migrated.threshold, 31);
+        // An out-of-range interval falls back to the whole-line default.
+        for bad in [
+            "QuietBattery\t7\npreferences\t1\t20\t1\t5\t1\n",
+            "QuietBattery\t7\npreferences\t1\t20\t1\t3601\t1\n",
+            "QuietBattery\t7\npreferences\t1\t20\t2\t300\t1\n",
+            "QuietBattery\t7\npreferences\t1\t20\t1\t300\n",
+        ] {
+            let fallen = Manager::decode(bad);
+            assert_eq!(fallen.refresh_seconds, DEFAULT_REFRESH_SECONDS);
+            assert!(fallen.auto_refresh);
+            assert!(fallen.connection_notifications);
+        }
     }
     #[test]
     fn persisted_alert_cycle_and_unconfirmed_connection_survive_restart() {

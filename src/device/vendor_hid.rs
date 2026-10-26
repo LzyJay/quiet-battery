@@ -111,6 +111,11 @@ impl Adapter {
             kind: self.kind,
             supported: true,
             provider: self.name.into(),
+            connection: if p.wireless {
+                super::Connection::Receiver
+            } else {
+                super::Connection::Cable
+            },
         }
     }
     fn candidate(

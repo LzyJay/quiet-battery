@@ -104,6 +104,7 @@ fn grouped_candidates(
                 kind,
                 supported: false,
                 provider: "unsupported".into(),
+                connection: super::Connection::Unknown,
             },
             reading: None,
             error: Some(DeviceError::Unsupported("未确认电量查询协议".into())),

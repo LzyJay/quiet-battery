@@ -6,10 +6,13 @@
 //! `{104EA319-6EE2-4701-BD47-8DDBF425BBE5}` id 2. Reading that property is passive:
 //! it opens no radio connection, changes no pairing and sends no command.
 use super::{
-    Cancellation, Candidate, DeviceDescriptor, DeviceError, DeviceKind, PowerState,
+    Cancellation, Candidate, Connection, DeviceDescriptor, DeviceError, DeviceKind, PowerState,
     ProtocolAdapter, Reading,
 };
 use std::ptr::null_mut;
+use windows_sys::Win32::Devices::Bluetooth::{
+    BLUETOOTH_ADDRESS, BLUETOOTH_ADDRESS_0, BLUETOOTH_DEVICE_INFO, BluetoothGetDeviceInfo,
+};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_PRESENT, HDEVINFO, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
     SetupDiGetClassDevsW, SetupDiGetDevicePropertyW,
@@ -115,6 +118,36 @@ fn display_name(friendly: &str) -> String {
         .to_string()
 }
 
+/// Twelve hex digits of the instance id as the radio address value.
+fn address_value(address: &str) -> Option<u64> {
+    if address.len() != 12 || !address.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(address, 16)
+        .ok()
+        .filter(|value| *value != 0)
+}
+
+/// Link state of a paired device from the local radio cache.
+///
+/// `BthHFEnum` keeps a node for every paired headset, including powered-off ones,
+/// so the devnode cannot tell a live link from a stale battery value. This query
+/// reads the cached `fConnected` flag: it issues no inquiry, opens no connection,
+/// changes no pairing and sends no profile command. `None` means the local cache
+/// could not answer, which must never be treated as a confirmed disconnect.
+fn link_state(address: &str) -> Option<bool> {
+    let value = address_value(address)?;
+    let mut info = BLUETOOTH_DEVICE_INFO {
+        dwSize: std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32,
+        Address: BLUETOOTH_ADDRESS {
+            Anonymous: BLUETOOTH_ADDRESS_0 { ullLong: value },
+        },
+        ..Default::default()
+    };
+    let result = unsafe { BluetoothGetDeviceInfo(null_mut(), &mut info) };
+    (result == 0).then_some(info.fConnected != 0)
+}
+
 fn collect(cancel: &Cancellation) -> Result<Vec<Entry>, DeviceError> {
     cancel.check()?;
     let set =
@@ -145,6 +178,11 @@ fn collect(cancel: &Cancellation) -> Result<Vec<Entry>, DeviceError> {
         let Some(address) = address_from_instance(&instance) else {
             continue;
         };
+        // A paired but powered-off headset keeps its node and last percentage.
+        // Only a confirmed live link becomes a present device.
+        if link_state(&address) == Some(false) {
+            continue;
+        }
         let Some((kind, bytes)) =
             (unsafe { property(guard.0, &info, &PKEY_BLUETOOTH_BATTERY, cancel) })
         else {
@@ -191,6 +229,7 @@ fn descriptor(entry: &Entry) -> DeviceDescriptor {
         kind: DeviceKind::Headset,
         supported: true,
         provider: "bthfp".into(),
+        connection: Connection::BluetoothClassic,
     }
 }
 
@@ -254,6 +293,15 @@ mod tests {
         assert_eq!(display_name("Redmi Buds 3 Hands-Free AG"), "Redmi Buds 3");
         assert_eq!(display_name("未命名设备"), "未命名设备");
         assert_eq!(display_name(""), "");
+    }
+
+    #[test]
+    fn radio_address_is_parsed_without_guessing() {
+        assert_eq!(address_value("189067A28B0A"), Some(0x1890_67A2_8B0A));
+        assert_eq!(address_value("000000000000"), None);
+        assert_eq!(address_value("189067A28B0"), None);
+        assert_eq!(address_value("189067A28B0G"), None);
+        assert_eq!(address_value(""), None);
     }
 
     #[test]
