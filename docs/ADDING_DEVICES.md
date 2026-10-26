@@ -11,6 +11,8 @@
 | 新协议或新传输方式 | 新建独立模块，在 Registry 登记发现和读取入口；UI 与设备管理不改 |
 | 只能枚举到设备，不知道电量协议 | 保留为未支持候选，不生成读数，不把枚举当适配完成 |
 
+标准通道与厂商 HID 都不通时，先读[私有通道资料](RESEARCH-PRIVATE-CHANNELS.md)判断还有哪些路可走——USB 复合设备的音频接口由类驱动独占，用户态没有入口；厂商驱动的 KS 属性需要属性集证据。判断自己是否又在重复既有错误，读[调查踩坑记录](PITFALLS.md)，其中"关键词过滤漏掉裸 GUID 键名"和"把 report ID 当报文头"两条已经各自造成过一次错误结论。
+
 ## 接线地图
 
 - `src/device/mod.rs`：`DeviceKind`、`DeviceDescriptor`、`Candidate`、`Reading`、`BatterySource`、`DeviceError` 与 `Registry`。
