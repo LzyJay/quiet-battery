@@ -4,7 +4,7 @@
 
 <img src="assets/source/software/icon-256.png" width="120" alt="Quiet Battery">
 
-<img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4?style=for-the-badge&logo=windows&logoColor=white" />
+<img src="https://img.shields.io/badge/platform-Windows%2010%2022H2-0078D4?style=for-the-badge&logo=windows&logoColor=white" />
 <img src="https://img.shields.io/badge/Rust-2024%20edition-000000?style=for-the-badge&logo=rust&logoColor=white" />
 <img src="https://img.shields.io/badge/version-0.5.0-2EA043?style=for-the-badge" />
 <img src="https://img.shields.io/badge/license-PolyForm%20NC-3DA639?style=for-the-badge" />
