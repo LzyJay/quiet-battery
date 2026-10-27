@@ -612,9 +612,6 @@ impl App {
                                 .as_ptr(),
                             );
                         }
-                        if self.page == Page::Main {
-                            EnableWindow(row.refresh, i32::from(!self.busy));
-                        }
                         if self.page == Page::Add {
                             SetWindowTextW(
                                 row.refresh,
@@ -1479,9 +1476,10 @@ impl App {
                 }
                 match self.page {
                     Page::Main => {
-                        self.place(row.model, 64, y + 3, 150, 26, 1);
-                        self.place(row.percent, 366, y + 2, 88, 44, 2);
-                        self.place(row.refresh, 460, y + 7, 82, 36, 0);
+                        // No per-row button: the freed width goes to the model
+                        // name, which used to truncate early.
+                        self.place(row.model, 64, y + 3, 232, 26, 1);
+                        self.place(row.percent, 456, y + 2, 80, 44, 2);
                     }
                     Page::Settings => {
                         self.place(row.model, 64, y + 6, 238, 40, 1);
@@ -1613,6 +1611,8 @@ impl App {
                 );
                 let mut extra = Vec::new();
                 let (percent, refresh) = match self.page {
+                    // The main page has no per-row action: values arrive on the
+                    // refresh cadence, and the tray menu owns the manual pass.
                     Page::Main => (
                         create_child(
                             self.panel,
@@ -1621,13 +1621,7 @@ impl App {
                             SS_LEFT | SS_NOPREFIX | SS_CENTERIMAGE,
                             ROW_BASE + index as u32 * 3 + 1,
                         ),
-                        create_child(
-                            self.panel,
-                            "BUTTON",
-                            "手动刷新",
-                            WS_TABSTOP | BS_PUSHBUTTON as u32,
-                            ROW_BASE + index as u32 * 3 + 2,
-                        ),
+                        null_mut(),
                     ),
                     Page::Settings => {
                         let base = SETTINGS_BASE + index as u32 * 3;
@@ -1682,7 +1676,7 @@ impl App {
                         ),
                     ),
                 };
-                if self.page != Page::Settings {
+                if self.page == Page::Add {
                     style_control(refresh, false);
                 }
                 if self.page == Page::Add {
@@ -2197,7 +2191,7 @@ impl App {
             if self.page == Page::Settings {
                 targets.push((row.percent, Some(index)));
             }
-            if self.page != Page::Add {
+            if self.page == Page::Settings {
                 targets.push((row.refresh, Some(index)));
             }
             for h in &row.extra {
@@ -3438,16 +3432,22 @@ unsafe extern "system" fn panel_proc(
 fn cell_fill(percent: Option<u8>, cell: i32) -> i32 {
     percent.map_or(0, |p| (i32::from(p) - cell * 10).clamp(0, 10))
 }
-unsafe fn draw_battery(dc: HDC, y: i32, reading: Option<&Reading>, colors: &PanelColors) {
+unsafe fn draw_battery(
+    dc: HDC,
+    left: i32,
+    y: i32,
+    reading: Option<&Reading>,
+    colors: &PanelColors,
+) {
     unsafe {
         SetDCPenColor(dc, colors.outline);
         SetDCBrushColor(dc, colors.paper);
-        RoundRect(dc, 210, y + 16, 337, y + 40, 3, 3);
+        RoundRect(dc, left, y + 16, left + 127, y + 40, 3, 3);
         SetDCBrushColor(dc, colors.outline);
-        Rectangle(dc, 339, y + 23, 342, y + 33);
+        Rectangle(dc, left + 129, y + 23, left + 132, y + 33);
         if let Some(reading) = reading {
             for cell in 0..10 {
-                let x = 214 + cell * 12;
+                let x = left + 4 + cell * 12;
                 SetDCBrushColor(dc, colors.empty);
                 SetDCPenColor(dc, colors.empty);
                 Rectangle(dc, x, y + 20, x + 10, y + 36);
@@ -3464,9 +3464,9 @@ unsafe fn draw_battery(dc: HDC, y: i32, reading: Option<&Reading>, colors: &Pane
                 dc,
                 "?",
                 RECT {
-                    left: 210,
+                    left,
                     top: y + 14,
-                    right: 337,
+                    right: left + 127,
                     bottom: y + 42,
                 },
                 19,
@@ -3476,12 +3476,30 @@ unsafe fn draw_battery(dc: HDC, y: i32, reading: Option<&Reading>, colors: &Pane
         }
         if reading.is_some_and(|r| r.power_state == crate::device::PowerState::Charging) {
             let points = [
-                POINT { x: 354, y: y + 16 },
-                POINT { x: 347, y: y + 29 },
-                POINT { x: 353, y: y + 29 },
-                POINT { x: 350, y: y + 40 },
-                POINT { x: 360, y: y + 24 },
-                POINT { x: 354, y: y + 24 },
+                POINT {
+                    x: left + 144,
+                    y: y + 16,
+                },
+                POINT {
+                    x: left + 137,
+                    y: y + 29,
+                },
+                POINT {
+                    x: left + 143,
+                    y: y + 29,
+                },
+                POINT {
+                    x: left + 140,
+                    y: y + 40,
+                },
+                POINT {
+                    x: left + 150,
+                    y: y + 24,
+                },
+                POINT {
+                    x: left + 144,
+                    y: y + 24,
+                },
             ];
             SetDCBrushColor(dc, colors.fill);
             SetDCPenColor(dc, colors.fill);
@@ -3638,7 +3656,7 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
                 RestoreDC(dc, saved);
             }
             if view.page == Page::Main {
-                draw_battery(dc, y, state.reading.as_ref(), &colors);
+                draw_battery(dc, 302, y, state.reading.as_ref(), &colors);
                 SetTextColor(dc, colors.secondary);
                 panel_text(
                     dc,
@@ -3646,7 +3664,7 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
                     RECT {
                         left: 64,
                         top: y + 27,
-                        right: 240,
+                        right: 300,
                         bottom: y + 47,
                     },
                     12,
@@ -5279,6 +5297,7 @@ mod tests {
                     error: None,
                     connected: true,
                     connection_known: true,
+                    unreadable: 0,
                 });
             }
             app.show_panel();
@@ -5494,6 +5513,7 @@ mod tests {
             error: None,
             connected: false,
             connection_known: false,
+            unreadable: 0,
         };
         // Before the first discovery the link is genuinely unknown, never "down".
         assert_eq!(row_detail(&state), "2.4G · 连接状态未知");
@@ -5897,7 +5917,7 @@ mod tests {
                     crate::device::PowerState::Discharging,
                 )
                 .unwrap();
-                draw_battery(dc, 0, Some(&reading), &colors);
+                draw_battery(dc, 210, 0, Some(&reading), &colors);
                 let x = 214 + cell * 12;
                 if width > 0 {
                     assert_eq!(GetPixel(dc, x + width - 1, 25), colors.fill);

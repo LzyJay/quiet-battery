@@ -388,7 +388,7 @@ mod tests {
         }
     }
     #[test]
-    fn sleeping_or_failed_receiver_preserves_success_and_other_device_health() {
+    fn silent_receiver_keeps_the_value_then_hides_without_losing_health() {
         let a = Collection {
             container: Some("receiver-a".into()),
             ..Default::default()
@@ -404,7 +404,10 @@ mod tests {
         };
         let mut manager = crate::manager::Manager::default();
         manager.merge(vec![success(&a), success(&b)], 100);
-        for identity_confirmed in [true, false] {
+        // A receiver stays on the bus while the mouse behind it sleeps or is off,
+        // so one silent pass keeps the cached value and a second one hides the
+        // device. Neither pass may drop the cache or disturb the other device.
+        for (pass, identity_confirmed) in [true, false].into_iter().enumerate() {
             let candidate = unavailable(
                 &a,
                 QueryFailure {
@@ -413,7 +416,7 @@ mod tests {
                 },
             );
             assert_eq!(candidate.descriptor.endpoint.is_some(), identity_confirmed);
-            manager.merge(vec![candidate, success(&b)], 200);
+            manager.merge(vec![candidate, success(&b)], 200 + pass as u64 * 100);
             assert_eq!(manager.devices.len(), 2);
             let old = manager
                 .devices
@@ -421,18 +424,29 @@ mod tests {
                 .find(|s| s.descriptor.physical_id == a.key())
                 .unwrap();
             assert_eq!(old.last_success, Some(100));
-            assert!(old.connected && old.selected && old.descriptor.supported);
+            assert!(old.selected && old.descriptor.supported);
+            assert_eq!(old.connected, pass == 0);
             assert_eq!(old.reading.as_ref().unwrap().normalized_percent(), 9);
             assert!(old.error.is_some());
+            assert_eq!(manager.visible().count(), 2 - pass);
             let healthy = manager
                 .devices
                 .iter()
                 .find(|s| s.descriptor.physical_id == b.key())
                 .unwrap();
-            assert_eq!(healthy.last_success, Some(200));
+            assert_eq!(healthy.last_success, Some(200 + pass as u64 * 100));
             assert!(healthy.error.is_none());
-            assert_eq!(manager.visible().count(), 2);
         }
+        // A reply brings the hidden device back with its old value intact.
+        manager.merge(vec![success(&a), success(&b)], 400);
+        assert_eq!(manager.visible().count(), 2);
+        let restored = manager
+            .devices
+            .iter()
+            .find(|s| s.descriptor.physical_id == a.key())
+            .unwrap();
+        assert!(restored.connected && restored.error.is_none());
+        assert_eq!(restored.reading.as_ref().unwrap().normalized_percent(), 9);
     }
     #[test]
     fn changed_pairing_hides_old_battery_without_inheriting_it() {
