@@ -102,7 +102,11 @@ fn parse(p: Profile, b: &[u8]) -> Result<Option<Reading>, DeviceError> {
     let (percent, state) = if raw & 0x80 != 0 {
         (raw & 0x7F, PowerState::Charging)
     } else {
-        (raw, PowerState::Unknown(255))
+        // The flag is a boolean: clear means "not charging", which is the same
+        // convention the MCHOSE mouse adapter uses for its charging byte. It has
+        // to be stated, not left unknown, or the "left the charger" edge that
+        // restarts the usage clock never fires.
+        (raw, PowerState::Discharging)
     };
     if percent > 100 {
         return Err(DeviceError::Protocol("迈从耳机电量百分比超出范围".into()));
@@ -204,7 +208,7 @@ mod tests {
         );
         assert_eq!(
             parse(profile(), &reply(89)).unwrap().unwrap().power_state,
-            PowerState::Unknown(255)
+            PowerState::Discharging
         );
         // Captured on hardware the moment charging started: bit 7 set, low
         // bits unchanged, then one point higher two minutes into charging.
