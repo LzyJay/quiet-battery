@@ -10,6 +10,7 @@ mod licenses;
 mod manager;
 mod notifications;
 mod save_dialog;
+mod shapes;
 mod startup;
 mod status_ipc;
 mod storage;

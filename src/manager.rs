@@ -7,6 +7,77 @@ use crate::device::{
 };
 use crate::notifications::AlertRecord;
 use std::path::{Path, PathBuf};
+/// One completed "full to low" discharge run: from the last reading of 100%
+/// seen while the pack was not charging to the first reading at or below the
+/// alert threshold. Persisted, because a run can span a process restart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageCycle {
+    pub ended: u64,
+    pub seconds: u64,
+    /// Percentage the pack read when the run closed (the first reading at or
+    /// below the alert threshold). `None` for rows written before v12: the
+    /// start of a run is always 100%, but the end value was never stored.
+    pub ended_percent: Option<u8>,
+}
+/// How many completed runs are kept per device; older ones fall off the front.
+/// Five completed runs per device. The history page shows them all, so this is
+/// also what the user sees: enough to compare packs, short of an ever-growing
+/// file.
+pub const USAGE_CYCLE_LIMIT: usize = 5;
+impl UsageCycle {
+    /// `ended:seconds` entries joined with commas, or `-` when none exist.
+    pub fn encode(cycles: &[UsageCycle]) -> String {
+        if cycles.is_empty() {
+            return "-".into();
+        }
+        cycles
+            .iter()
+            .map(|cycle| {
+                format!(
+                    "{}:{}:{}",
+                    cycle.ended,
+                    cycle.seconds,
+                    cycle
+                        .ended_percent
+                        .map_or_else(|| "-".into(), |percent| percent.to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    pub fn decode(text: &str) -> Option<Vec<UsageCycle>> {
+        if text == "-" {
+            return Some(Vec::new());
+        }
+        if text.len() > 512 {
+            return None;
+        }
+        let mut cycles = Vec::new();
+        for entry in text.split(',') {
+            let mut parts = entry.split(':');
+            let ended = parts.next()?.parse::<u64>().ok()?;
+            let seconds = parts.next()?.parse::<u64>().ok()?;
+            if seconds == 0 {
+                return None;
+            }
+            // v12 appends the closing percentage. An older row ends here and
+            // keeps "unknown" rather than borrowing a number from its neighbours.
+            let ended_percent = match parts.next() {
+                None | Some("-") => None,
+                Some(text) => Some(text.parse::<u8>().ok().filter(|percent| *percent <= 100)?),
+            };
+            if parts.next().is_some() {
+                return None;
+            }
+            cycles.push(UsageCycle {
+                ended,
+                seconds,
+                ended_percent,
+            });
+        }
+        (cycles.len() <= USAGE_CYCLE_LIMIT).then_some(cycles)
+    }
+}
 #[derive(Clone, Debug)]
 pub struct DeviceState {
     pub descriptor: DeviceDescriptor,
@@ -28,14 +99,25 @@ pub struct DeviceState {
     /// charged. Persisted: an idle period with the device switched off still
     /// counts as "in use" unless the value went up while it was away.
     pub usage_since: Option<u64>,
+    /// Percentage the running discharge cycle started from. Persisted from v12;
+    /// older files leave it unknown instead of guessing a start value.
+    pub usage_from: Option<u8>,
     /// Last value/power pair seen while linked, used to recognise a completed
     /// charge. Transient, rebuilt from the cached reading on load.
     pub last_seen: Option<(u8, PowerState)>,
+    /// Completed full-to-threshold runs, oldest first.
+    pub usage_cycles: Vec<UsageCycle>,
+    /// When the pack last read 100% while not charging: the start of the run
+    /// the first threshold reading will close. Persisted so a run that spans a
+    /// restart still records one duration instead of two.
+    pub full_since: Option<u64>,
 }
-/// How long a device may stay silent (timeout, not an invalid frame) before the
-/// link is treated as down. Long enough to ride out one dropped frame, short
-/// enough that a powered-off device does not linger.
-pub const SILENT_GRACE_SECONDS: u64 = 30;
+/// How long a device may stay silent (a timeout, never an invalid frame) before
+/// the link is treated as down. A confirmed protocol-level disconnect and a
+/// frame that fails its own checks skip this window entirely, so it only ever
+/// filters a single dropped query: one grace period covers the pass that failed,
+/// the next probe decides.
+pub const SILENT_GRACE_SECONDS: u64 = 5;
 impl DeviceState {
     /// A failed query is evidence about the link, never about the value.
     fn silence(&mut self, error: &DeviceError, now: u64) {
@@ -44,6 +126,9 @@ impl DeviceState {
         if matches!(error, DeviceError::Protocol(_) | DeviceError::NotFound) {
             // The device answered with something invalid, or the adapter could
             // not find it at all: nothing is behind this endpoint right now.
+            // A protocol-level disconnect event (BLE `ConnectionStatusChanged`)
+            // arrives here as NotFound, so the link layer's own supervision
+            // timeout is the only wait — never an extra app-level window on top.
             self.connected = false;
             self.silent_since = None;
             return;
@@ -64,7 +149,7 @@ impl DeviceState {
     /// from a confirmed link-down with a higher value than it had when the link
     /// dropped. `resumed` means exactly that transition; a device that was never
     /// seen before (or just loaded from disk) is not "coming back".
-    fn note_charge(&mut self, now: u64, resumed: bool) {
+    fn note_charge(&mut self, now: u64, resumed: bool, threshold: u8) {
         let Some(reading) = self.reading.as_ref() else {
             return;
         };
@@ -81,6 +166,9 @@ impl DeviceState {
         let gained_while_away = resumed && previous_percent.is_some_and(|before| percent > before);
         if left_charger || gained_while_away || self.usage_since.is_none() {
             self.usage_since = Some(now);
+            // The percentage this run started from. Without it the history page
+            // could only say "98%" and not where the run began.
+            self.usage_from = Some(percent);
         }
         // Percent always follows the newest reading; power keeps the last known
         // value so an Unknown sample cannot hide a charge that ended.
@@ -89,6 +177,28 @@ impl DeviceState {
         } else {
             power
         };
+        // Full-to-low history. A run opens at the first 100% reading seen while
+        // the pack is not charging and closes at the first reading at or below
+        // the alert threshold, so the recorded duration is exactly "one full
+        // charge emptied down to the reminder". Charging abandons an open run:
+        // the pack was topped up, so nothing is owed to the threshold.
+        if power == PowerState::Charging {
+            self.full_since = None;
+        } else if percent >= 100 {
+            self.full_since.get_or_insert(now);
+        } else if percent <= threshold
+            && let Some(since) = self.full_since.take()
+            && now > since
+        {
+            self.usage_cycles.push(UsageCycle {
+                ended: now,
+                seconds: now - since,
+                ended_percent: Some(percent),
+            });
+            if self.usage_cycles.len() > USAGE_CYCLE_LIMIT {
+                self.usage_cycles.remove(0);
+            }
+        }
         self.last_seen = Some((percent, power));
     }
 }
@@ -101,6 +211,17 @@ pub struct Manager {
     pub auto_refresh: bool,
     /// Seconds between automatic refreshes when `auto_refresh` is set.
     pub refresh_seconds: u32,
+    /// Left edge and **bottom** edge of the main window as it was last closed,
+    /// in physical pixels. The bottom is remembered because the panel hangs off
+    /// the taskbar like a flyout: when the device count changes it has to grow
+    /// upwards instead of drifting down over the taskbar. `None` means "never
+    /// placed": the shell centres it and drops it on the work-area bottom.
+    pub panel_anchor: Option<(i32, i32)>,
+    /// Keep the panel nailed to the bottom-right corner. When this is off the
+    /// window can be dragged and reopens where it was left; when it is on the
+    /// remembered anchor is ignored, because a pinned window has no position of
+    /// its own to remember.
+    pub window_pinned: bool,
     /// Shell toast for confirmed link up/down transitions.
     pub connection_notifications: bool,
     pub pending_alerts: Vec<(String, String, u8)>,
@@ -120,6 +241,8 @@ impl Default for Manager {
             threshold: 20,
             auto_refresh: true,
             refresh_seconds: DEFAULT_REFRESH_SECONDS,
+            panel_anchor: None,
+            window_pinned: true,
             connection_notifications: true,
             pending_alerts: Vec::new(),
             pending_connections: Vec::new(),
@@ -129,10 +252,37 @@ impl Default for Manager {
         }
     }
 }
-/// Two minutes: the historical cadence before the setting existed.
-pub const DEFAULT_REFRESH_SECONDS: u32 = 120;
+/// Five minutes. Devices that publish the standard Battery Level characteristic
+/// push their own updates, so this is only the fallback that corrects a UI which
+/// has heard nothing for a while. ChromiumOS landed on ten minutes for exactly
+/// that reason; five keeps the row honest without waking a sleeping peripheral
+/// every two minutes, which is what the previous default did.
+pub const DEFAULT_REFRESH_SECONDS: u32 = 300;
+/// The historical default. Files written before the settings version carried the
+/// new default keep this value, so an upgrade moves it once instead of leaving
+/// every existing install on the old cadence forever.
+pub const LEGACY_REFRESH_SECONDS: u32 = 120;
 /// Bounds accepted from the settings field, in minutes.
 pub const REFRESH_MINUTES: std::ops::RangeInclusive<u32> = 1..=60;
+/// Link checks while the user is at the machine: a mouse that was just switched
+/// off should leave the list before its owner stops looking at it.
+pub const PRESENCE_ACTIVE_SECONDS: u32 = 15;
+/// Link checks once no input has arrived for [`IDLE_AFTER_SECONDS`]. Nobody is
+/// reading the list then, and every probe wakes the peripheral's radio, so the
+/// cadence stretches fourfold.
+pub const PRESENCE_IDLE_SECONDS: u32 = 60;
+/// No keyboard or mouse input for this long means the session is idle. Four
+/// active presence cycles: long enough that reading a page does not count as
+/// being away, short enough that walking off does not keep the radio awake.
+pub const IDLE_AFTER_SECONDS: u64 = 60;
+/// Fallback poll below the alert threshold: the next whole-number change is the
+/// one the user is waiting for, so this is the one case that justifies speeding
+/// up again.
+pub const LOW_REFRESH_SECONDS: u32 = 120;
+/// Idle sessions stretch the fallback poll by four times, up to this ceiling. A
+/// longer interval the user chose is left as it is: the rule only ever slows
+/// things down, never shortens one.
+pub const IDLE_REFRESH_SECONDS: u32 = 600;
 impl Manager {
     pub fn load(path: &Path) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
@@ -146,6 +296,12 @@ impl Manager {
                             | "QuietBattery\t7"
                             | "QuietBattery\t8"
                             | "QuietBattery\t9"
+                            | "QuietBattery\t10"
+                            | "QuietBattery\t11"
+                            | "QuietBattery\t12"
+                            | "QuietBattery\t13"
+                            | "QuietBattery\t14"
+                            | "QuietBattery\t15"
                     )
                 ) {
                     return Err("设置文件格式无法识别，原文件未修改".into());
@@ -162,6 +318,49 @@ impl Manager {
     pub fn visible(&self) -> impl Iterator<Item = &DeviceState> {
         self.selected()
             .filter(|s| s.connected || !s.connection_known)
+    }
+    /// A monitored, present pack below the alert threshold that is not on the
+    /// charger: the only case where a faster fallback poll buys the user
+    /// anything. An unknown power state counts as discharging — the threshold
+    /// rule that raises the alert uses the same reading.
+    fn low_pack(&self) -> bool {
+        self.selected().any(|state| {
+            state.connected
+                && state.reading.as_ref().is_some_and(|reading| {
+                    reading.normalized_percent() < self.threshold
+                        && !matches!(reading.power_state, PowerState::Charging | PowerState::Full)
+                })
+        })
+    }
+    /// Fallback battery poll in seconds. Devices on the standard Battery Level
+    /// characteristic have already pushed their value, so this interval only
+    /// corrects a row that has not heard from them; it stays loose and reacts to
+    /// the two cases that justify a change: a pack inside the alert band, and a
+    /// session nobody is watching.
+    pub fn refresh_cadence(&self, idle: bool) -> u32 {
+        let mut seconds = self.refresh_seconds;
+        if self.low_pack() {
+            seconds = seconds.min(LOW_REFRESH_SECONDS);
+        } else if idle {
+            // Same proportional rest for everyone, capped by the idle ceiling and
+            // never shorter than the user's own interval: an interval picked as
+            // tight as one minute stays minutes, while the default five minutes
+            // lands exactly on ten.
+            seconds = seconds
+                .saturating_mul(4)
+                .min(IDLE_REFRESH_SECONDS)
+                .max(seconds);
+        }
+        seconds.clamp(REFRESH_MINUTES.start() * 60, REFRESH_MINUTES.end() * 60)
+    }
+    /// Link-probe interval in seconds. The battery cadence is independent: a
+    /// probe never replaces the displayed value or its timestamp.
+    pub fn presence_cadence(&self, idle: bool) -> u32 {
+        if idle {
+            PRESENCE_IDLE_SECONDS
+        } else {
+            PRESENCE_ACTIVE_SECONDS
+        }
     }
     #[cfg(test)]
     pub fn merge(&mut self, candidates: Vec<Candidate>, timestamp: u64) {
@@ -272,7 +471,7 @@ impl Manager {
                         .iter()
                         .find(|(id, _, _)| *id == state.descriptor.id)
                         .is_some_and(|(_, connected, known)| !*connected && *known);
-                    state.note_charge(timestamp, resumed);
+                    state.note_charge(timestamp, resumed, self.threshold);
                 } else if let Some(error) = &candidate.error {
                     state.silence(error, timestamp);
                 } else {
@@ -300,6 +499,14 @@ impl Manager {
                     .reading
                     .as_ref()
                     .map(|reading| (reading.normalized_percent(), reading.power_state));
+                // The run starts at this sample, so its starting percentage is
+                // this sample's value — recorded here because `note_charge` only
+                // fills it when the clock is opened by a later reading.
+                let usage_from = if success {
+                    last_seen.map(|(percent, _)| percent)
+                } else {
+                    None
+                };
                 self.devices.push(DeviceState {
                     descriptor: candidate.descriptor,
                     selected: automatic,
@@ -316,8 +523,17 @@ impl Manager {
                     // First sighting starts the clock: we have no older charge
                     // evidence, and a blank field would be less useful.
                     usage_since: success.then_some(timestamp),
+                    usage_from,
                     last_seen,
+                    usage_cycles: Vec::new(),
+                    full_since: None,
                 });
+                // Seed the discharge history from the first sample, exactly as a
+                // later update would, so a device first seen at 100% starts its
+                // run here instead of waiting for the next pass.
+                if let Some(state) = self.devices.last_mut() {
+                    state.note_charge(timestamp, false, self.threshold);
+                }
             }
         }
         for state in &mut self.devices {
@@ -446,7 +662,7 @@ impl Manager {
                     if keep_value {
                         state.reading = Some(reading);
                         state.last_success = Some(timestamp);
-                        state.note_charge(timestamp, !before.0 && before.1);
+                        state.note_charge(timestamp, !before.0 && before.1, self.threshold);
                     }
                     state.error = None;
                     state.answered();
@@ -501,12 +717,17 @@ impl Manager {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let mut text = format!(
-            "QuietBattery\t9\npreferences\t{}\t{}\t{}\t{}\t{}\n",
+            "QuietBattery\t15\npreferences\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             u8::from(self.notifications_enabled),
             self.threshold,
             u8::from(self.auto_refresh),
             self.refresh_seconds,
-            u8::from(self.connection_notifications)
+            u8::from(self.connection_notifications),
+            self.panel_anchor
+                .map_or_else(|| "-".into(), |(left, _)| left.to_string()),
+            self.panel_anchor
+                .map_or_else(|| "-".into(), |(_, bottom)| bottom.to_string()),
+            u8::from(self.window_pinned)
         );
         for state in &self.devices {
             // Only user choices and successful data are durable; enumeration-only
@@ -520,7 +741,7 @@ impl Manager {
                 _ => "percent".into(),
             };
             text.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 hex(&state.descriptor.id),
                 hex(&state.descriptor.name),
                 state.descriptor.kind.key(),
@@ -547,7 +768,14 @@ impl Manager {
                 state
                     .usage_since
                     .map_or_else(|| "-".into(), |t| t.to_string()),
-                state.descriptor.connection.key()
+                state.descriptor.connection.key(),
+                state
+                    .full_since
+                    .map_or_else(|| "-".into(), |t| t.to_string()),
+                UsageCycle::encode(&state.usage_cycles),
+                state
+                    .usage_from
+                    .map_or_else(|| "-".into(), |percent| percent.to_string())
             ));
         }
         let temporary = path.with_extension("tmp");
@@ -564,6 +792,12 @@ impl Manager {
             Some("QuietBattery\t7") => 7,
             Some("QuietBattery\t8") => 8,
             Some("QuietBattery\t9") => 9,
+            Some("QuietBattery\t10") => 10,
+            Some("QuietBattery\t11") => 11,
+            Some("QuietBattery\t12") => 12,
+            Some("QuietBattery\t13") => 13,
+            Some("QuietBattery\t14") => 14,
+            Some("QuietBattery\t15") => 15,
             _ => return manager,
         };
         let mut device_records = 0;
@@ -571,7 +805,16 @@ impl Manager {
             let fields: Vec<_> = line.split('\t').collect();
             if fields.first() == Some(&"preferences") {
                 if version >= 7 {
-                    if fields.len() == 6
+                    // v13 appends the last window position; older files carry
+                    // five values and simply have no remembered spot.
+                    let expected = if version >= 15 {
+                        9
+                    } else if version >= 13 {
+                        8
+                    } else {
+                        6
+                    };
+                    if fields.len() == expected
                         && matches!(fields[1], "0" | "1")
                         && fields[2]
                             .parse::<u8>()
@@ -585,8 +828,50 @@ impl Manager {
                         manager.notifications_enabled = fields[1] == "1";
                         manager.threshold = fields[2].parse().unwrap();
                         manager.auto_refresh = fields[3] == "1";
-                        manager.refresh_seconds = fields[4].parse().unwrap();
+                        // v11 replaces the old two-minute default once. An
+                        // interval the user actually changed (1, 3, 10 minutes…)
+                        // is evidence and stays exactly as stored.
+                        let stored = fields[4].parse::<u32>().unwrap();
+                        manager.refresh_seconds =
+                            if version >= 11 || stored != LEGACY_REFRESH_SECONDS {
+                                stored
+                            } else {
+                                DEFAULT_REFRESH_SECONDS
+                            };
                         manager.connection_notifications = fields[5] == "1";
+                        // v13 stored a top-left; v14 stores left + bottom. The
+                        // old pair cannot be converted without the height it was
+                        // saved with, so it is dropped rather than misread.
+                        manager.panel_anchor = if version >= 14 {
+                            match (fields[6], fields[7]) {
+                                ("-", "-") => None,
+                                (x, y) => match (x.parse::<i32>(), y.parse::<i32>()) {
+                                    // Screen coordinates live in an i16 range;
+                                    // anything else is a damaged row, not a place
+                                    // Windows could ever put a window.
+                                    (Ok(x), Ok(y))
+                                        if (-32_768..=32_767).contains(&x)
+                                            && (-32_768..=32_767).contains(&y) =>
+                                    {
+                                        Some((x, y))
+                                    }
+                                    _ => return manager,
+                                },
+                            }
+                        } else {
+                            None
+                        };
+                        // Older files predate the switch: the window was pinned
+                        // to the corner then too, so that is what they mean.
+                        manager.window_pinned = if version >= 15 {
+                            match fields[8] {
+                                "0" => false,
+                                "1" => true,
+                                _ => return manager,
+                            }
+                        } else {
+                            true
+                        };
                     }
                 } else if version == 6
                     && fields.len() == 3
@@ -610,7 +895,9 @@ impl Manager {
                     5 => 15,
                     6 | 7 => 17,
                     8 => 18,
-                    _ => 19,
+                    9 => 19,
+                    10 | 11 => 21,
+                    _ => 22,
                 }
             {
                 continue;
@@ -719,6 +1006,35 @@ impl Manager {
             } else {
                 last_success
             };
+            // v10 records the full-charge marker and the completed runs.
+            // Older files simply start with no history; nothing is invented.
+            let (full_since, usage_cycles) = if version >= 10 {
+                let full_since = match fields[19] {
+                    "-" => None,
+                    text => match text.parse::<u64>() {
+                        Ok(time) if time <= now.saturating_add(300) => Some(time),
+                        _ => continue,
+                    },
+                };
+                let Some(cycles) = UsageCycle::decode(fields[20]) else {
+                    continue;
+                };
+                (full_since, cycles)
+            } else {
+                (None, Vec::new())
+            };
+            // v12 records the percentage the current run started from.
+            let usage_from = if version >= 12 {
+                match fields[21] {
+                    "-" => None,
+                    text => match text.parse::<u8>() {
+                        Ok(percent) if percent <= 100 => Some(percent),
+                        _ => continue,
+                    },
+                }
+            } else {
+                None
+            };
             let last_seen = reading
                 .as_ref()
                 .map(|reading| (reading.normalized_percent(), reading.power_state));
@@ -795,7 +1111,10 @@ impl Manager {
                 connection_known: false,
                 silent_since: None,
                 usage_since,
+                usage_from,
                 last_seen,
+                usage_cycles,
+                full_since,
             });
         }
         manager
@@ -930,6 +1249,35 @@ mod tests {
         drop(lock);
         std::fs::remove_file(path).unwrap();
         assert!(loaded.err().is_some_and(|e| e.contains("无法读取设置文件")));
+    }
+    #[test]
+    fn panel_anchor_survives_a_restart_and_bad_values_are_rejected() {
+        let mut manager = Manager::default();
+        assert_eq!(manager.panel_anchor, None);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".build/tmp/window-{}.state", std::process::id()));
+        manager.panel_anchor = Some((-12, 480));
+        manager.save(&path);
+        let restored = Manager::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(restored.panel_anchor, Some((-12, 480)));
+        // A file without the columns has no remembered spot, and neither has a
+        // v13 file: that pair held a top-left, not a bottom edge.
+        let old = Manager::decode("QuietBattery\t11\npreferences\t1\t20\t1\t300\t1\n");
+        assert_eq!(old.panel_anchor, None);
+        let v13 = Manager::decode("QuietBattery\t13\npreferences\t1\t20\t1\t300\t1\t120\t340\n");
+        assert_eq!(v13.panel_anchor, None);
+        // Out-of-range or non-numeric coordinates drop the preference row back
+        // to its defaults instead of placing a window Windows cannot show.
+        for bad in [
+            "QuietBattery\t14\npreferences\t1\t20\t1\t300\t1\tabc\t420\n",
+            "QuietBattery\t14\npreferences\t1\t20\t1\t300\t1\t70000\t420\n",
+            "QuietBattery\t14\npreferences\t1\t20\t1\t300\t1\t120\n",
+        ] {
+            let fallen = Manager::decode(bad);
+            assert_eq!(fallen.panel_anchor, None);
+            assert_eq!(fallen.refresh_seconds, DEFAULT_REFRESH_SECONDS);
+        }
     }
     #[test]
     fn v6_preferences_do_not_consume_the_512_device_budget() {
@@ -1331,16 +1679,64 @@ mod tests {
         assert_eq!(manager.devices[0].silent_since, Some(400));
     }
     #[test]
-    fn only_a_timeout_waits_for_the_grace_window() {
+    fn only_a_timeout_waits_for_the_short_grace_window() {
         let mut manager = Manager::default();
         manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
         manager.merge(vec![silent("mouse")], 200);
         assert!(manager.devices[0].connected);
-        manager.merge(vec![silent("mouse")], 220);
+        // The window covers the pass that failed and nothing more: it is not a
+        // second 30-second layer stacked on the link's own supervision timeout.
+        manager.merge(vec![silent("mouse")], 204);
         assert!(manager.devices[0].connected);
-        manager.merge(vec![silent("mouse")], 231);
+        manager.merge(vec![silent("mouse")], 206);
         assert!(!manager.devices[0].connected);
         assert_eq!(manager.visible().count(), 0);
+    }
+    #[test]
+    fn cadence_slows_when_idle_and_speeds_up_inside_the_alert_band() {
+        let mut manager = Manager::default();
+        assert_eq!(manager.refresh_seconds, DEFAULT_REFRESH_SECONDS);
+        assert_eq!(manager.refresh_cadence(false), DEFAULT_REFRESH_SECONDS);
+        assert_eq!(manager.refresh_cadence(true), IDLE_REFRESH_SECONDS);
+        // A tight interval stays minutes: the idle rest is proportional, never a
+        // flat ten minutes on top of whatever the user picked.
+        manager.refresh_seconds = 60;
+        assert_eq!(manager.refresh_cadence(true), 240);
+        manager.refresh_seconds = LEGACY_REFRESH_SECONDS;
+        assert_eq!(manager.refresh_cadence(true), 480);
+        manager.refresh_seconds = DEFAULT_REFRESH_SECONDS;
+        assert_eq!(manager.presence_cadence(false), PRESENCE_ACTIVE_SECONDS);
+        assert_eq!(manager.presence_cadence(true), PRESENCE_IDLE_SECONDS);
+        // A pack inside the alert band is worth a tighter fallback even while
+        // the session is idle: that reading is the one the user is waiting for.
+        manager.merge(
+            vec![charged_candidate("mouse", 19, PowerState::Discharging)],
+            100,
+        );
+        assert_eq!(manager.refresh_cadence(false), LOW_REFRESH_SECONDS);
+        assert_eq!(manager.refresh_cadence(true), LOW_REFRESH_SECONDS);
+        // Charging suppresses the acceleration: the pack is going up and the
+        // charger, not the poll, is what changes it.
+        manager.merge(
+            vec![charged_candidate("mouse", 19, PowerState::Charging)],
+            200,
+        );
+        assert_eq!(manager.refresh_cadence(true), IDLE_REFRESH_SECONDS);
+        // A longer interval the user chose survives the idle ceiling…
+        manager.refresh_seconds = 3_600;
+        assert_eq!(manager.refresh_cadence(true), 3_600);
+        // …and a low pack may shorten it, but the accepted range still binds.
+        manager.merge(
+            vec![charged_candidate("mouse", 10, PowerState::Discharging)],
+            300,
+        );
+        assert_eq!(manager.refresh_cadence(false), LOW_REFRESH_SECONDS);
+        manager.threshold = 5;
+        manager.merge(
+            vec![charged_candidate("mouse", 10, PowerState::Discharging)],
+            400,
+        );
+        assert_eq!(manager.refresh_cadence(false), 3_600);
     }
     #[test]
     fn a_presence_read_also_drives_the_link_and_announces_both_ways() {
@@ -1485,6 +1881,174 @@ mod tests {
         assert_eq!(migrated.devices[0].usage_since, Some(5_000));
     }
     #[test]
+    fn full_to_threshold_runs_record_one_cycle_and_survive_a_restart() {
+        let mut manager = Manager::default();
+        assert_eq!(manager.threshold, 20);
+        // 100% while discharging opens the run...
+        manager.merge(
+            vec![charged_candidate("mouse", 100, PowerState::Discharging)],
+            1_000,
+        );
+        assert_eq!(manager.devices[0].full_since, Some(1_000));
+        // ...readings above the threshold leave it open...
+        manager.merge(
+            vec![charged_candidate("mouse", 60, PowerState::Discharging)],
+            2_000,
+        );
+        assert!(manager.devices[0].usage_cycles.is_empty());
+        // ...and the first reading at the alert threshold closes it once.
+        manager.merge(
+            vec![charged_candidate("mouse", 20, PowerState::Discharging)],
+            4_600,
+        );
+        assert_eq!(manager.devices[0].full_since, None);
+        assert_eq!(
+            manager.devices[0].usage_cycles,
+            vec![UsageCycle {
+                ended: 4_600,
+                seconds: 3_600,
+                // The reading that closed the run: the threshold sample of 20%
+                // fed in at 4_600.
+                ended_percent: Some(20),
+            }]
+        );
+        manager.merge(
+            vec![charged_candidate("mouse", 10, PowerState::Discharging)],
+            5_600,
+        );
+        assert_eq!(manager.devices[0].usage_cycles.len(), 1);
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".build/tmp/cycles-{}.state", std::process::id()));
+        manager.save(&path);
+        let restored = Manager::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            restored.devices[0].usage_cycles,
+            manager.devices[0].usage_cycles
+        );
+
+        // Charging abandons an open run instead of banking it as a cycle.
+        manager.merge(
+            vec![charged_candidate("mouse", 100, PowerState::Discharging)],
+            9_000,
+        );
+        assert_eq!(manager.devices[0].full_since, Some(9_000));
+        manager.merge(
+            vec![charged_candidate("mouse", 100, PowerState::Charging)],
+            9_100,
+        );
+        assert_eq!(manager.devices[0].full_since, None);
+        assert_eq!(manager.devices[0].usage_cycles.len(), 1);
+    }
+    #[test]
+    fn usage_history_keeps_five_runs_and_their_percentages() {
+        let mut manager = Manager::default();
+        for run in 0..6u64 {
+            let start = 1_000 + run * 1_000;
+            manager.merge(
+                vec![charged_candidate("mouse", 100, PowerState::Discharging)],
+                start,
+            );
+            manager.merge(
+                vec![charged_candidate("mouse", 20, PowerState::Discharging)],
+                start + 600,
+            );
+        }
+        // Six runs happened; the oldest fell off instead of growing the file.
+        assert_eq!(
+            manager.devices[0].usage_cycles.len(),
+            USAGE_CYCLE_LIMIT,
+            "limit {USAGE_CYCLE_LIMIT}"
+        );
+        assert_eq!(
+            manager.devices[0].usage_cycles.first().unwrap().ended,
+            2_600
+        );
+        assert_eq!(manager.devices[0].usage_cycles.last().unwrap().ended, 6_600);
+        assert!(
+            manager.devices[0]
+                .usage_cycles
+                .iter()
+                .all(|cycle| cycle.ended_percent == Some(20)),
+            "the closing reading is the threshold sample"
+        );
+        assert_eq!(manager.devices[0].usage_from, Some(100));
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".build/tmp/history-{}.state", std::process::id()));
+        manager.save(&path);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let restored = Manager::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            restored.devices[0].usage_cycles,
+            manager.devices[0].usage_cycles
+        );
+        assert_eq!(restored.devices[0].usage_from, Some(100));
+
+        // A v11 file has one column fewer: the runs still load, the start
+        // percentage is unknown instead of being guessed.
+        let downgraded: String = saved
+            .lines()
+            .map(|line| {
+                if line.starts_with("QuietBattery\t") {
+                    "QuietBattery\t11".to_string()
+                } else if line.split('\t').count() > 21 {
+                    let mut fields: Vec<&str> = line.split('\t').collect();
+                    fields.pop();
+                    fields.join("\t")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let legacy = Manager::decode(&downgraded);
+        assert_eq!(legacy.devices.len(), 1);
+        assert_eq!(legacy.devices[0].usage_from, None);
+        assert_eq!(legacy.devices[0].usage_cycles.len(), USAGE_CYCLE_LIMIT);
+    }
+    #[test]
+    fn usage_cycle_encoding_rejects_damaged_rows() {
+        let cycle = UsageCycle {
+            ended: 4_600,
+            seconds: 3_600,
+            ended_percent: Some(9),
+        };
+        assert_eq!(UsageCycle::encode(&[]), "-");
+        assert_eq!(UsageCycle::decode("-"), Some(Vec::new()));
+        let text = UsageCycle::encode(&[cycle]);
+        assert_eq!(text, "4600:3600:9");
+        assert_eq!(UsageCycle::decode(&text), Some(vec![cycle]));
+        // Rows written before v12 carry no closing percentage. They stay valid
+        // and report "unknown" instead of borrowing a number.
+        assert_eq!(
+            UsageCycle::decode("4600:3600"),
+            Some(vec![UsageCycle {
+                ended: 4_600,
+                seconds: 3_600,
+                ended_percent: None,
+            }])
+        );
+        for damaged in [
+            "",
+            "4600",
+            "4600:",
+            "4600:0",
+            "a:b",
+            "4600:3600:abc",
+            "4600:3600:101",
+            "4600:3600:9:1",
+            "4600:3600,x:1",
+        ] {
+            assert!(UsageCycle::decode(damaged).is_none(), "{damaged}");
+        }
+        let too_many = vec![cycle; USAGE_CYCLE_LIMIT + 1];
+        assert!(UsageCycle::decode(&UsageCycle::encode(&too_many)).is_none());
+    }
+    #[test]
     fn the_link_type_survives_a_restart_and_old_rows_infer_it() {
         let mut manager = Manager::default();
         let mut headset = candidate("bt", DeviceKind::Headset, true);
@@ -1608,12 +2172,13 @@ mod tests {
         assert!(manager.pending_connections.is_empty());
     }
     #[test]
-    fn v7_preferences_roundtrip_and_older_files_keep_the_old_cadence() {
+    fn v7_preferences_roundtrip_and_older_files_use_the_current_default() {
         let mut manager = Manager::default();
         manager.merge(vec![candidate("opaque", DeviceKind::Mouse, true)], 100);
         manager.auto_refresh = false;
         manager.refresh_seconds = 300;
         manager.connection_notifications = false;
+        manager.panel_anchor = Some((120, 340));
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
             ".build/tmp/preferences-{}.state",
             std::process::id()
@@ -1624,12 +2189,23 @@ mod tests {
         assert!(!restored.auto_refresh);
         assert_eq!(restored.refresh_seconds, 300);
         assert!(!restored.connection_notifications);
+        assert_eq!(restored.panel_anchor, Some((120, 340)));
         let migrated = Manager::decode("QuietBattery\t6\npreferences\t0\t31\n");
         assert!(migrated.auto_refresh);
         assert_eq!(migrated.refresh_seconds, DEFAULT_REFRESH_SECONDS);
         assert!(migrated.connection_notifications);
         assert!(!migrated.notifications_enabled);
         assert_eq!(migrated.threshold, 31);
+        // v11 moves the historical two-minute default once, so an upgrade does
+        // not leave every existing install on the old cadence forever…
+        let upgraded = Manager::decode("QuietBattery\t10\npreferences\t1\t20\t1\t120\t1\n");
+        assert_eq!(upgraded.refresh_seconds, DEFAULT_REFRESH_SECONDS);
+        // …while an interval the user actually picked is evidence and stays.
+        let explicit = Manager::decode("QuietBattery\t10\npreferences\t1\t20\t1\t600\t1\n");
+        assert_eq!(explicit.refresh_seconds, 600);
+        // v11 files carry real values, including a deliberate two minutes.
+        let kept = Manager::decode("QuietBattery\t11\npreferences\t1\t20\t1\t120\t1\n");
+        assert_eq!(kept.refresh_seconds, LEGACY_REFRESH_SECONDS);
         // An out-of-range interval falls back to the whole-line default.
         for bad in [
             "QuietBattery\t7\npreferences\t1\t20\t1\t5\t1\n",

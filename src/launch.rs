@@ -39,13 +39,19 @@ fn failure_text(error: &str) -> String {
         };
     format!("{error}\n\n{advice}")
 }
+/// The icon is what makes Windows play the critical-stop sound. The test suite
+/// opens this real dialog on every build — in the owner's own session, on a
+/// private desktop nobody can see — so an icon there turns `cargo test` into an
+/// audible error nobody can act on. Tests keep the dialog itself (same owner,
+/// title, text and modality) and drop only the icon.
+const FAILURE_ICON: u32 = if cfg!(test) { 0 } else { MB_ICONERROR };
 pub fn show_error(error: &str) {
     unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
             wide(&failure_text(error)).as_ptr(),
             wide("Quiet Battery 启动失败").as_ptr(),
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+            MB_OK | FAILURE_ICON | MB_SETFOREGROUND,
         );
     }
 }

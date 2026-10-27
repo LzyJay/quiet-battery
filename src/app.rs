@@ -6,6 +6,7 @@ use crate::{
     },
     icons::{BatteryVisual, SymbolIcon, TrayIcon},
     manager::{self, DeviceState, Manager},
+    shapes::{Rect, Surface},
     startup::{self, wide},
 };
 use std::{
@@ -43,9 +44,12 @@ const RESULT: u32 = WM_APP + 2;
 const TRAY: u32 = WM_APP + 3;
 const EVENTS_READY: u32 = WM_APP + 4;
 /// Link check cadence. Separate from the battery refresh interval: one query per
-/// monitored device, no enumeration and no BLE scan.
+/// monitored device, no enumeration and no BLE scan. The interval is re-armed
+/// from the session state on every tick, so an idle machine probes less often.
 const PRESENCE_TIMER: usize = 4;
-const PRESENCE_MILLIS: u32 = 15_000;
+/// One-shot guard for the first paint: the panel waits for the first discovery
+/// pass so it never opens at the height of devices that are no longer there.
+const REVEAL_TIMER: usize = 5;
 pub const REFRESH: usize = 1;
 pub const QUIT: usize = 2;
 pub const SIMULATE_ERROR: usize = 3;
@@ -72,14 +76,39 @@ const AUTO_REFRESH: u32 = 116;
 const REFRESH_INTERVAL: u32 = 117;
 const INTERVAL_LABEL: u32 = 118;
 const INTERVAL_UNIT: u32 = 119;
-const SETTINGS_BASE: u32 = 4000;
+/// The one line under the interval field that explains what the number costs.
+const INTERVAL_HINT: u32 = 121;
+/// "Window pinned": keeps the panel nailed to the bottom-right corner.
+const WINDOW_PIN: u32 = 123;
+/// The main header link into the usage history page.
+const HISTORY: u32 = 122;
 const ADD_BASE: u32 = 8000;
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// Actions per add-page row: 0 add, 1 copy, 2 remove.
+const ADD_STRIDE: u32 = 3;
+/// Per-device switches live on the main page; the id encodes the row index.
+const MAIN_TRAY_BASE: u32 = 12000;
+const MAIN_NOTIFY_BASE: u32 = 14000;
+/// The single settings-page switch that flips every device at once.
+const ALL_SWITCHES: u32 = 120;
+/// One corner radius for every custom-drawn rounded control (96-dpi units).
+/// Buttons, input frames and focus rings share it so the chrome reads as one
+/// system; the toggle track is a full pill and the battery keeps its own scale.
+const RADIUS_CONTROL: f32 = 6.0;
+const RADIUS_BATTERY: f32 = 4.0;
+/// Device symbol edge in 96-dpi units and its offset inside a 64px row: the
+/// 28px glyph is centred against the two-line name/connection block.
+const SYMBOL_SIZE: i32 = 28;
+const SYMBOL_LEFT: i32 = 24;
+const SYMBOL_TOP: i32 = 12;
+/// Row pitch. Tall enough for the switch captions above the pair.
+const ROW_HEIGHT: i32 = 64;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Page {
     #[default]
     Main,
     Settings,
     Add,
+    History,
 }
 impl Page {
     fn index(self) -> usize {
@@ -87,6 +116,7 @@ impl Page {
             Self::Main => 0,
             Self::Settings => 1,
             Self::Add => 2,
+            Self::History => 3,
         }
     }
     fn key(self) -> &'static str {
@@ -94,6 +124,7 @@ impl Page {
             Self::Main => "main",
             Self::Settings => "settings",
             Self::Add => "add",
+            Self::History => "history",
         }
     }
 }
@@ -131,6 +162,8 @@ struct SupportJob {
 struct PanelView {
     scroll: i32,
     page: Page,
+    /// Mirrored for the window procedure: a pinned panel has no drag handle.
+    pinned: bool,
     threshold_error: bool,
     interval_error: bool,
     rows: Vec<DeviceState>,
@@ -190,7 +223,8 @@ enum UiEvent {
     Activity,
     Discover,
     Menu(Instant, u32),
-    ShowPanel,
+    TogglePanel,
+    RevealPanel,
     ClosePanel,
     MainDestroyed,
     PanelDestroyed(HWND),
@@ -225,7 +259,26 @@ struct RowControls {
     tooltip: HWND,
     _tooltip_text: Vec<u16>,
     extra: Vec<HWND>,
-    presentation: (String, String, DeviceKind, bool),
+    presentation: (String, String, DeviceKind, bool, String),
+    /// Main page only: per-device tray and low-battery switches.
+    tray: HWND,
+    notify: HWND,
+}
+impl RowControls {
+    /// Focusable children in tab order. Null holes are dropped on both the
+    /// capture and the restore side, so anchors stay stable within a page.
+    fn focusable(&self) -> Vec<HWND> {
+        [self.percent, self.tray, self.notify, self.refresh]
+            .into_iter()
+            .chain(self.extra.iter().copied())
+            .filter(|hwnd| !hwnd.is_null())
+            .collect()
+    }
+    fn switches(&self) -> impl Iterator<Item = HWND> {
+        [self.tray, self.notify]
+            .into_iter()
+            .filter(|hwnd| !hwnd.is_null())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FocusAnchor {
@@ -274,9 +327,19 @@ struct App {
     panel_fonts: [HFONT; 4],
     panel_icons: [HICON; 2],
     last_activity_refresh: Instant,
+    /// Interval last handed to timer 1. A cadence re-check leaves an unchanged
+    /// countdown alone instead of restarting it on every heartbeat.
+    refresh_timer_seconds: Cell<u32>,
+    /// Same for timer 4. Without it every burst of input would push the next
+    /// link check a full interval into the future, and a second device that died
+    /// while the user kept typing would go unnoticed.
+    presence_timer_seconds: Cell<u32>,
+    /// The window exists but is still hidden, waiting for the first discovery
+    /// pass to settle the row count (and therefore the height).
+    awaiting_first_pass: bool,
     picker_ids: Vec<String>,
     page: Page,
-    page_scroll: [i32; 3],
+    page_scroll: [i32; 4],
     page_controls: Vec<HWND>,
     threshold_error: bool,
     interval_error: bool,
@@ -385,11 +448,192 @@ fn row_detail(state: &DeviceState) -> String {
             format!("{link} · 连接状态未知")
         };
     }
+    // The reading age lives in the header summary; repeating it on every row
+    // just duplicated the same string.
+    let mut text = format!("{link} · {}", usage_text(state));
+    // History rides at the end of the same line: the last completed full-to-low
+    // run is the number the user asked to see, and the tooltip carries the rest.
+    if let Some(cycle) = state.usage_cycles.last() {
+        text.push_str(&format!(" · 满电续航{}", cycle_duration(cycle.seconds)));
+    }
+    text
+}
+/// One-line summary for the main header: how many devices are listed, the lowest
+/// value among them and how fresh the numbers are. Everything comes from the
+/// rows on screen, so the bar can never disagree with the list below it.
+fn main_summary(view: &PanelView) -> String {
+    if view.rows.is_empty() {
+        return "暂无设备".into();
+    }
+    let mut parts = vec![format!("{} 台设备", view.rows.len())];
+    if let Some(percent) = view
+        .rows
+        .iter()
+        .filter_map(|state| {
+            state
+                .reading
+                .as_ref()
+                .map(|reading| reading.normalized_percent())
+        })
+        .min()
+    {
+        parts.push(format!("最低 {percent}%"));
+    }
+    parts.push(updated_age(
+        view.rows
+            .iter()
+            .filter_map(|state| state.last_success)
+            .max(),
+    ));
+    parts.join(" · ")
+}
+
+/// Longest completed run, or `None` when the pack has not finished one yet.
+fn longest_cycle(state: &DeviceState) -> Option<&manager::UsageCycle> {
+    state.usage_cycles.iter().max_by_key(|cycle| cycle.seconds)
+}
+/// One line per device: the longest and the shortest completed full charge. A
+/// single record states its length once; no record says so plainly instead of
+/// borrowing the run in progress.
+fn history_span(state: &DeviceState) -> String {
+    let mut seconds: Vec<u64> = state
+        .usage_cycles
+        .iter()
+        .map(|cycle| cycle.seconds)
+        .collect();
+    if seconds.is_empty() {
+        return "尚无完整满电记录".into();
+    }
+    seconds.sort_unstable();
+    let longest = cycle_duration(*seconds.last().unwrap());
+    if seconds.len() == 1 {
+        return format!("最长 {longest}");
+    }
+    format!("最长 {longest} · 最短 {}", cycle_duration(seconds[0]))
+}
+fn percent_text(percent: u8) -> String {
+    format!("{percent}%")
+}
+/// Local `MM-DD HH:MM`, with the year when the stamp is not from this year.
+fn stamp_text(unix: u64) -> String {
+    let Some((year, month, day, hour, minute)) = local_stamp(unix) else {
+        return "—".into();
+    };
+    let this_year = local_stamp(now()).map_or(year, |parts| parts.0);
+    if year == this_year {
+        format!("{month:02}-{day:02} {hour:02}:{minute:02}")
+    } else {
+        format!("{year}-{month:02}-{day:02} {hour:02}:{minute:02}")
+    }
+}
+/// Unix seconds to local wall-clock parts. `None` when the value is out of
+/// range or the time-zone conversion fails, so the caller prints a dash rather
+/// than a wrong clock.
+fn local_stamp(unix: u64) -> Option<(u16, u16, u16, u16, u16)> {
+    use windows_sys::Win32::{
+        Foundation::{FILETIME, SYSTEMTIME},
+        Storage::FileSystem::FileTimeToLocalFileTime,
+        System::Time::FileTimeToSystemTime,
+    };
+    unsafe {
+        let ticks = unix
+            .saturating_add(11_644_473_600)
+            .checked_mul(10_000_000)?;
+        let file = FILETIME {
+            dwLowDateTime: ticks as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+        let mut local: FILETIME = std::mem::zeroed();
+        if FileTimeToLocalFileTime(&file, &mut local) == 0 {
+            return None;
+        }
+        let mut parts: SYSTEMTIME = std::mem::zeroed();
+        if FileTimeToSystemTime(&local, &mut parts) == 0 {
+            return None;
+        }
+        Some((
+            parts.wYear,
+            parts.wMonth,
+            parts.wDay,
+            parts.wHour,
+            parts.wMinute,
+        ))
+    }
+}
+/// The discharge in progress: when it started, where the value went and how
+/// long it has run. Runs that began before the starting percentage was stored
+/// are counted from 100%, the value a full charge starts from.
+fn history_current_text(state: &DeviceState) -> String {
+    if state
+        .reading
+        .as_ref()
+        .is_some_and(|reading| reading.power_state == crate::device::PowerState::Charging)
+    {
+        return "当前 · 充电中".into();
+    }
+    let Some(since) = state.usage_since else {
+        return "当前 · 尚未开始记录".into();
+    };
+    let current = state
+        .reading
+        .as_ref()
+        .map_or(100, |reading| reading.normalized_percent());
     format!(
-        "{link} · {} · {}",
-        usage_text(state),
-        updated_age(state.last_success)
+        "当前 {} → 现在 · {} → {} · 已用{}",
+        stamp_text(since),
+        percent_text(state.usage_from.unwrap_or(100)),
+        percent_text(current),
+        short_duration(now().saturating_sub(since))
     )
+}
+/// Duration of one discharge run. Unlike `short_duration` this keeps minutes for
+/// multi-hour runs, because the point is comparing one cycle against another.
+fn cycle_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return "不到1分钟".into();
+    }
+    if seconds < 3_600 {
+        return format!("{}分钟", seconds / 60);
+    }
+    if seconds < 86_400 {
+        let hours = seconds / 3_600;
+        let minutes = seconds % 3_600 / 60;
+        return if minutes == 0 {
+            format!("{hours}小时")
+        } else {
+            format!("{hours}小时{minutes}分")
+        };
+    }
+    let days = seconds / 86_400;
+    let hours = seconds % 86_400 / 3_600;
+    if hours == 0 || days >= 10 {
+        format!("{days}天")
+    } else {
+        format!("{days}天{hours}小时")
+    }
+}
+/// Hover text: full model name plus the recent full-to-low history.
+fn tooltip_text(state: &DeviceState) -> String {
+    let mut text = format!(
+        "{} · {}",
+        state.descriptor.name,
+        state.descriptor.connection.label()
+    );
+    let Some(latest) = state.usage_cycles.last() else {
+        return text;
+    };
+    text.push_str(&format!("\n满电续航 {}", cycle_duration(latest.seconds)));
+    let recent: Vec<String> = state
+        .usage_cycles
+        .iter()
+        .rev()
+        .take(3)
+        .map(|cycle| cycle_duration(cycle.seconds))
+        .collect();
+    if recent.len() > 1 {
+        text.push_str(&format!("\n最近{}次：{}", recent.len(), recent.join(" / ")));
+    }
+    text
 }
 /// How long the current discharge cycle has been running. A charge is only
 /// claimed when the device said so, or when the value came back higher than the
@@ -629,6 +873,7 @@ impl App {
         *self.bridge.view.borrow_mut() = Rc::new(PanelView {
             scroll: self.scroll,
             page: self.page,
+            pinned: self.manager.window_pinned,
             threshold_error: self.threshold_error,
             interval_error: self.interval_error,
             rows: self.page_states(),
@@ -679,6 +924,11 @@ impl App {
                                 i32::from(state.descriptor.supported && !state.selected),
                             );
                             for (index, h) in row.extra.iter().enumerate() {
+                                if index > 0 {
+                                    // The second action is removal; its label and
+                                    // enabled state do not follow the capture job.
+                                    continue;
+                                }
                                 let file = index == 1;
                                 let active = self
                                     .support_job
@@ -852,6 +1102,9 @@ impl App {
                     }
                     self.persist();
                     self.rebuild_rows();
+                    // The row count is settled: this is the moment the panel may
+                    // appear, at its final height.
+                    self.reveal_panel();
                 }
                 WorkerResult::Discovery(Err(error)) => {
                     for state in &mut self.manager.devices {
@@ -1366,30 +1619,82 @@ impl App {
     fn page_states(&self) -> Vec<DeviceState> {
         match self.page {
             Page::Main => self.manager.visible().cloned().collect(),
-            Page::Settings => self.manager.selected().cloned().collect(),
+            // The settings page is a fixed form now: switches live on the main
+            // page and removal moved to the add page.
+            Page::Settings => Vec::new(),
             Page::Add => self
                 .picker_ids
                 .iter()
                 .filter_map(|id| self.manager.devices.iter().find(|s| s.descriptor.id == *id))
                 .cloned()
                 .collect(),
+            // Every device that is connected right now, longest run first. A
+            // pack without a completed run is not excluded: its row still says
+            // when the current discharge started and where the value went, which
+            // is the question this page answers for a new device.
+            Page::History => {
+                let mut states: Vec<DeviceState> = self
+                    .manager
+                    .selected()
+                    .filter(|state| state.connected)
+                    .cloned()
+                    .collect();
+                states.sort_by(|a, b| {
+                    longest_cycle(b)
+                        .map_or(0, |cycle| cycle.seconds)
+                        .cmp(&longest_cycle(a).map_or(0, |cycle| cycle.seconds))
+                        .then_with(|| a.descriptor.name.cmp(&b.descriptor.name))
+                });
+                states
+            }
         }
     }
     fn row_top(&self) -> i32 {
         match self.page {
-            Page::Main => 20,
+            Page::Main => 68,
             Page::Settings => 320,
-            Page::Add => 76,
+            Page::Add | Page::History => 76,
         }
     }
+    /// True when every device in the settings list has both per-device switches
+    /// on. An empty list counts as "off" so the master switch cannot claim a
+    /// state it does not govern.
+    fn all_switches_on(&self) -> bool {
+        let mut any = false;
+        for state in self.manager.selected() {
+            any = true;
+            if !(state.show_tray && state.notify) {
+                return false;
+            }
+        }
+        any
+    }
     fn viewport_top(&self) -> i32 {
-        if self.page == Page::Main { 20 } else { 64 }
+        if self.page == Page::Main { 68 } else { 64 }
+    }
+    /// Keep the master switch's tick and label in step with the device rows.
+    fn sync_all_switch(&self) {
+        if self.panel.is_null() {
+            return;
+        }
+        unsafe {
+            let all = GetDlgItem(self.panel, ALL_SWITCHES as i32);
+            if all.is_null() {
+                return;
+            }
+            let on = self.all_switches_on();
+            let before = SendMessageW(all, BM_GETCHECK, 0, 0);
+            if before != usize::from(on) as isize {
+                SendMessageW(all, BM_SETCHECK, usize::from(on), 0);
+                InvalidateRect(all, null(), 0);
+            }
+        }
     }
     fn content_height(&self) -> i32 {
         if self.rows.is_empty() {
-            if self.page == Page::Settings { 256 } else { 0 }
+            0
         } else {
-            self.row_top() - self.viewport_top() + self.rows.len() as i32 * 64
+            self.row_top() - self.viewport_top() + self.rows.len() as i32 * ROW_HEIGHT
         }
     }
     fn work_area(&self) -> RECT {
@@ -1420,12 +1725,12 @@ impl App {
     fn panel_height(&self) -> i32 {
         let natural = if self.rows.is_empty() {
             match self.page {
-                Page::Main => 132,
-                Page::Settings => 344,
-                Page::Add => 180,
+                Page::Main => 200,
+                Page::Settings => 304,
+                Page::Add | Page::History => 180,
             }
         } else {
-            self.row_top() + self.rows.len() as i32 * 64 + self.footer_height()
+            self.row_top() + self.rows.len() as i32 * ROW_HEIGHT + self.footer_height()
         };
         natural.min(self.max_height())
     }
@@ -1509,7 +1814,7 @@ impl App {
                     get(ADD),
                     if self.rows.is_empty() { 190 } else { 18 },
                     if self.rows.is_empty() {
-                        24
+                        112
                     } else {
                         self.panel_height() - 38
                     },
@@ -1518,6 +1823,9 @@ impl App {
                     0,
                 );
                 self.place(get(SETTINGS), 486, self.panel_height() - 38, 56, 32, 0);
+                // Header link, left of the two column captions, so it never
+                // competes with the row content below.
+                self.place(get(HISTORY), 366, 18, 84, 24, 0);
             } else {
                 self.place(get(BACK), 18, 12, 32, 36, 0);
                 if self.page == Page::Add {
@@ -1525,19 +1833,22 @@ impl App {
                 }
                 if self.page == Page::Settings {
                     for (id, x, y, w, h) in [
-                        (STARTUP, 24, 68, 512, 40),
+                        (STARTUP, 24, 68, 248, 40),
+                        (CONNECTIONS, 288, 68, 248, 40),
                         (ALERTS, 24, 116, 248, 40),
-                        (CONNECTIONS, 288, 116, 248, 40),
-                        (113, 24, 168, 220, 32),
-                        (THRESHOLD, 464, 168, 56, 32),
-                        (114, 524, 168, 12, 32),
-                        (AUTO_REFRESH, 24, 216, 248, 40),
-                        (INTERVAL_LABEL, 288, 220, 96, 32),
-                        (REFRESH_INTERVAL, 436, 220, 56, 32),
-                        (INTERVAL_UNIT, 496, 220, 40, 32),
+                        (113, 288, 120, 168, 32),
+                        (THRESHOLD, 464, 122, 56, 28),
+                        (114, 524, 122, 12, 28),
+                        (AUTO_REFRESH, 24, 164, 248, 40),
+                        (INTERVAL_LABEL, 288, 168, 120, 32),
+                        (REFRESH_INTERVAL, 436, 170, 56, 28),
+                        (INTERVAL_UNIT, 496, 170, 40, 28),
+                        (INTERVAL_HINT, 24, 202, 512, 22),
+                        (ALL_SWITCHES, 24, 232, 248, 40),
+                        (WINDOW_PIN, 288, 232, 248, 40),
                     ] {
                         let y = y - self.scroll;
-                        self.place(get(id), x, y, w, h, 0);
+                        self.place(get(id), x, y, w, h, if id == INTERVAL_HINT { 3 } else { 0 });
                         ShowWindow(
                             get(id),
                             if y >= 64 && y + h <= self.panel_height() - self.footer_height() {
@@ -1550,11 +1861,12 @@ impl App {
                 }
             }
             for (index, row) in self.rows.iter().enumerate() {
-                let y = self.row_top() + index as i32 * 64 - self.scroll;
+                let y = self.row_top() + index as i32 * ROW_HEIGHT - self.scroll;
                 let visible = y >= self.viewport_top()
                     && y + 56 <= self.panel_height() - self.footer_height();
                 for control in [row.model, row.percent, row.refresh]
                     .into_iter()
+                    .chain(row.switches())
                     .chain(row.extra.iter().copied())
                 {
                     if !control.is_null() {
@@ -1563,31 +1875,56 @@ impl App {
                 }
                 match self.page {
                     Page::Main => {
-                        // No per-row button: the freed width goes to the model
-                        // name, which used to truncate early.
-                        self.place(row.model, 64, y + 3, 232, 26, 1);
-                        self.place(row.percent, 456, y + 2, 80, 44, 2);
+                        // Two storeys: name/battery/percentage on top, the
+                        // connection line plus both switches underneath. The
+                        // switches sit at the right edge of the second line so
+                        // the model name keeps almost its full width.
+                        self.place(row.model, 64, y + 8, 178, 26, 1);
+                        self.place(row.percent, 378, y + 8, 72, 28, 2);
+                        // One pill per control keeps a 4px gap between the
+                        // pair while both stay flush with the 536 right margin.
+                        self.place(row.tray, 456, y + 8, 38, 26, 0);
+                        self.place(row.notify, 498, y + 8, 38, 26, 0);
                     }
                     Page::Settings => {
-                        self.place(row.model, 64, y + 6, 238, 40, 1);
-                        self.place(row.percent, 334, y + 8, 40, 36, 0);
-                        self.place(row.refresh, 410, y + 8, 40, 36, 0);
+                        // The switches moved to the main page; only the row's
+                        // own removal action remains here.
+                        self.place(row.model, 64, y + 6, 400, 40, 1);
                         if let Some(remove) = row.extra.first() {
                             self.place(*remove, 494, y + 8, 50, 36, 0);
                         }
                     }
+                    Page::History => {
+                        // Two lines like the main page: name plus the two
+                        // completed-run durations on top, the run in progress
+                        // underneath (painted by the panel).
+                        self.place(row.model, 64, y + 8, 232, 26, 1);
+                    }
                     Page::Add => {
-                        self.place(row.model, 64, y + 6, 184, 40, 1);
-                        self.place(row.percent, 250, y + 6, 60, 40, 0);
-                        self.place(row.refresh, 490, y + 6, 54, 36, 0);
+                        self.place(row.model, 64, y + 6, 232, 40, 1);
+                        self.place(row.percent, 302, y + 6, 46, 40, 0);
+                        self.place(row.refresh, 428, y + 6, 52, 36, 0);
                         if !row.presentation.3 {
                             ShowWindow(row.refresh, SW_HIDE);
                         }
                         if let Some(copy) = row.extra.first() {
-                            self.place(*copy, 314, y + 6, 82, 36, 0);
+                            self.place(*copy, 358, y + 6, 66, 36, 0);
                         }
-                        if let Some(export) = row.extra.get(1) {
-                            self.place(*export, 400, y + 6, 82, 36, 0);
+                        if let Some(remove) = row.extra.get(1) {
+                            self.place(*remove, 484, y + 6, 52, 36, 0);
+                            let monitored = self
+                                .manager
+                                .devices
+                                .iter()
+                                .any(|s| s.descriptor.id == row.id && s.selected);
+                            ShowWindow(
+                                *remove,
+                                if monitored && visible {
+                                    SW_SHOW
+                                } else {
+                                    SW_HIDE
+                                },
+                            );
                         }
                     }
                 }
@@ -1610,15 +1947,19 @@ impl App {
             GetWindowRect(self.panel, &mut position);
             let width = bounds.right - bounds.left;
             let height = bounds.bottom - bounds.top;
+            // The bottom edge is the fixed one: the panel rests on the work-area
+            // bottom, so a page with more rows grows upwards instead of pushing
+            // its footer behind the taskbar.
+            let left = position
+                .left
+                .clamp(work.left, (work.right - width).max(work.left));
+            let top =
+                (position.bottom - height).clamp(work.top, (work.bottom - height).max(work.top));
             SetWindowPos(
                 self.panel,
                 null_mut(),
-                position
-                    .left
-                    .clamp(work.left, (work.right - width).max(work.left)),
-                position
-                    .top
-                    .clamp(work.top, (work.bottom - height).max(work.top)),
+                left,
+                top,
                 width,
                 height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
@@ -1649,7 +1990,8 @@ impl App {
             for row in self.rows.drain(..) {
                 for hwnd in [row.model, row.percent, row.refresh, row.tooltip]
                     .into_iter()
-                    .chain(row.extra)
+                    .chain(row.switches())
+                    .chain(row.extra.iter().copied())
                 {
                     if !hwnd.is_null() {
                         DestroyWindow(hwnd);
@@ -1680,6 +2022,7 @@ impl App {
                             s.descriptor.name.clone(),
                             s.descriptor.kind,
                             s.descriptor.supported,
+                            tooltip_text(s),
                         )
             });
         if unchanged && !force {
@@ -1707,51 +2050,49 @@ impl App {
                     ROW_BASE + index as u32 * 3,
                 );
                 let mut extra = Vec::new();
+                let mut tray = null_mut();
+                let mut notify = null_mut();
                 let (percent, refresh) = match self.page {
-                    // The main page has no per-row action: values arrive on the
-                    // refresh cadence, and the tray menu owns the manual pass.
-                    Page::Main => (
-                        create_child(
-                            self.panel,
-                            "STATIC",
-                            "—%",
-                            SS_LEFT | SS_NOPREFIX | SS_CENTERIMAGE,
-                            ROW_BASE + index as u32 * 3 + 1,
-                        ),
-                        null_mut(),
-                    ),
-                    Page::Settings => {
-                        let base = SETTINGS_BASE + index as u32 * 3;
-                        let tray = create_child(
+                    // The main page carries the value and both per-device
+                    // switches; the manual refresh still lives in the tray menu.
+                    Page::Main => {
+                        tray = create_child(
                             self.panel,
                             "BUTTON",
                             &format!("{name}，显示托盘"),
                             WS_TABSTOP | BS_AUTOCHECKBOX as u32,
-                            base,
+                            MAIN_TRAY_BASE + index as u32,
                         );
-                        let notify = create_child(
+                        notify = create_child(
                             self.panel,
                             "BUTTON",
                             &format!("{name}，低电提醒"),
                             WS_TABSTOP | BS_AUTOCHECKBOX as u32,
-                            base + 1,
-                        );
-                        let remove = create_child(
-                            self.panel,
-                            "BUTTON",
-                            &format!("{name}，移除监控"),
-                            WS_TABSTOP | BS_PUSHBUTTON as u32,
-                            base + 2,
+                            MAIN_NOTIFY_BASE + index as u32,
                         );
                         style_control(tray, true);
                         style_control(notify, true);
-                        style_control(remove, false);
                         SendMessageW(tray, BM_SETCHECK, usize::from(state.show_tray), 0);
                         SendMessageW(notify, BM_SETCHECK, usize::from(state.notify), 0);
                         EnableWindow(notify, i32::from(self.manager.notifications_enabled));
-                        extra.push(remove);
-                        (tray, notify)
+                        (
+                            create_child(
+                                self.panel,
+                                "STATIC",
+                                "—%",
+                                SS_LEFT | SS_NOPREFIX | SS_CENTERIMAGE,
+                                ROW_BASE + index as u32 * 3 + 1,
+                            ),
+                            null_mut(),
+                        )
                     }
+                    // No device rows on this page: it is the fixed preferences
+                    // form plus the one master switch.
+                    Page::Settings => (null_mut(), null_mut()),
+                    // Read-only rows: the name is the only control. The two
+                    // durations are painted by the panel, which also gives them
+                    // the secondary colour a static would not.
+                    Page::History => (null_mut(), null_mut()),
                     Page::Add => (
                         create_child(
                             self.panel,
@@ -1769,7 +2110,7 @@ impl App {
                                 "—"
                             },
                             WS_TABSTOP | BS_PUSHBUTTON as u32,
-                            ADD_BASE + index as u32 * 3,
+                            ADD_BASE + index as u32 * ADD_STRIDE,
                         ),
                     ),
                 };
@@ -1777,23 +2118,26 @@ impl App {
                     style_control(refresh, false);
                 }
                 if self.page == Page::Add {
-                    for (action, label) in [(1, "复制信息"), (2, "导出文件")] {
+                    // Copy and remove only: export wrote the same report to a
+                    // file instead of the clipboard, so it duplicated this one.
+                    for (action, label) in [(1, "复制信息"), (2, "移除")] {
+                        let accessible = if action == 2 {
+                            format!("{name}，移除监控")
+                        } else {
+                            label.to_string()
+                        };
                         let h = create_child(
                             self.panel,
                             "BUTTON",
-                            label,
+                            &accessible,
                             WS_TABSTOP | BS_PUSHBUTTON as u32,
-                            ADD_BASE + index as u32 * 3 + action,
+                            ADD_BASE + index as u32 * ADD_STRIDE + action,
                         );
                         style_control(h, false);
                         extra.push(h);
                     }
                 }
-                let mut text = wide(&format!(
-                    "{} · {}",
-                    state.descriptor.name,
-                    state.descriptor.connection.label()
-                ));
+                let mut text = wide(&tooltip_text(state));
                 let tooltip = CreateWindowExW(
                     WS_EX_TOPMOST,
                     wide("tooltips_class32").as_ptr(),
@@ -1824,7 +2168,7 @@ impl App {
                         &tool as *const TTTOOLINFOW as isize,
                     );
                 }
-                if let Ok(symbol) = SymbolIcon::new(28 * dpi / 96, state.descriptor.kind) {
+                if let Ok(symbol) = SymbolIcon::new(SYMBOL_SIZE * dpi / 96, state.descriptor.kind) {
                     self.rows.push(RowControls {
                         id: state.descriptor.id.clone(),
                         model,
@@ -1839,7 +2183,10 @@ impl App {
                             state.descriptor.name.clone(),
                             state.descriptor.kind,
                             state.descriptor.supported,
+                            tooltip_text(state),
                         ),
+                        tray,
+                        notify,
                     });
                 }
             }
@@ -1860,11 +2207,7 @@ impl App {
             return None;
         }
         for (index, row) in self.rows.iter().enumerate() {
-            for (action, control) in [row.percent, row.refresh]
-                .into_iter()
-                .chain(row.extra.iter().copied())
-                .enumerate()
-            {
+            for (action, control) in row.focusable().into_iter().enumerate() {
                 if control == hwnd {
                     return Some(FocusAnchor::Device {
                         id: row.id.clone(),
@@ -1892,10 +2235,7 @@ impl App {
                     .position(|r| r.id == *id)
                     .unwrap_or_else(|| (*index).min(self.rows.len().saturating_sub(1)));
                 if let Some(row) = self.rows.get(index) {
-                    let controls = [row.percent, row.refresh]
-                        .into_iter()
-                        .chain(row.extra.iter().copied())
-                        .collect::<Vec<_>>();
+                    let controls = row.focusable();
                     if let Some(h) = controls.get(*action).copied().filter(|h| {
                         enabled(*h)
                             && unsafe { GetWindowLongPtrW(*h, GWL_STYLE) } & WS_TABSTOP as isize
@@ -1920,13 +2260,18 @@ impl App {
             for hwnd in self.page_controls.drain(..) {
                 DestroyWindow(hwnd);
             }
+            let all_on = self.all_switches_on();
             let mut add = |class: &str, label: &str, style: u32, id: u32| {
                 let h = create_child(self.panel, class, label, style, id);
                 self.page_controls.push(h);
                 h
             };
             if self.page == Page::Main {
-                for (id, label) in [(ADD, "＋ 添加设备"), (SETTINGS, "设置")] {
+                for (id, label) in [
+                    (ADD, "＋ 添加设备"),
+                    (SETTINGS, "设置"),
+                    (HISTORY, "历史使用"),
+                ] {
                     let h = add("BUTTON", label, WS_TABSTOP | BS_PUSHBUTTON as u32, id);
                     style_control(h, false);
                 }
@@ -1986,6 +2331,30 @@ impl App {
                     SendMessageW(interval, EM_SETLIMITTEXT, 8, 0);
                     EnableWindow(interval, i32::from(self.manager.auto_refresh));
                     add("STATIC", "分钟", SS_LEFT | SS_CENTERIMAGE, INTERVAL_UNIT);
+                    add(
+                        "STATIC",
+                        "调长间隔可延长外设续航；支持电量通知的外设会优先用通知更新。",
+                        SS_LEFT,
+                        INTERVAL_HINT,
+                    );
+                    // One switch for every device. The per-device pair lives on
+                    // the main page, next to the device it belongs to.
+                    let all = add(
+                        "BUTTON",
+                        "所有设备的托盘与提醒",
+                        WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+                        ALL_SWITCHES,
+                    );
+                    style_control(all, true);
+                    SendMessageW(all, BM_SETCHECK, usize::from(all_on), 0);
+                    let pin = add(
+                        "BUTTON",
+                        "窗口固定",
+                        WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+                        WINDOW_PIN,
+                    );
+                    style_control(pin, true);
+                    SendMessageW(pin, BM_SETCHECK, usize::from(self.manager.window_pinned), 0);
                 }
             }
         }
@@ -2026,15 +2395,14 @@ impl App {
             if self.panel.is_null() {
                 self.page = Page::Main;
                 self.panel = CreateWindowExW(
-                    WS_EX_CONTROLPARENT,
+                    // Tool window: no taskbar button and no Alt-Tab entry, the
+                    // way the shell's own flyouts behave.
+                    WS_EX_CONTROLPARENT | WS_EX_TOOLWINDOW,
                     wide(PANEL_CLASS).as_ptr(),
                     wide("外设电量").as_ptr(),
-                    WS_OVERLAPPED
-                        | WS_CAPTION
-                        | WS_SYSMENU
-                        | WS_MINIMIZEBOX
-                        | WS_CLIPCHILDREN
-                        | WS_VSCROLL,
+                    // Frameless, like the clock flyout: no caption to drag, so
+                    // the header band handles dragging instead (WM_NCHITTEST).
+                    WS_POPUP | WS_CLIPCHILDREN | WS_VSCROLL,
                     CW_USEDEFAULT,
                     CW_USEDEFAULT,
                     560,
@@ -2056,6 +2424,22 @@ impl App {
                 self.create_page_controls();
                 self.rebuild_rows();
                 self.layout_panel();
+                // Only after the first layout: the window height follows the
+                // content, and anchoring before that would be off by the delta.
+                self.apply_panel_position();
+                // Rows restored from disk are not proof of a live link. Without
+                // this the panel opens at the height of every saved device and
+                // then collapses to the connected ones — a window that visibly
+                // jumps and hangs over the desktop. Wait for the first pass.
+                self.awaiting_first_pass = !cfg!(test)
+                    && self
+                        .manager
+                        .devices
+                        .iter()
+                        .any(|state| !state.connection_known);
+                if self.awaiting_first_pass {
+                    SetTimer(self.hwnd, REVEAL_TIMER, 500, None);
+                }
             }
             self.publish_view();
             // Opening the window is the moment the user looks, so refresh the
@@ -2064,9 +2448,11 @@ impl App {
             if !self.busy {
                 self.discover();
             }
-            ShowWindow(self.panel, if cfg!(test) { SW_HIDE } else { SW_RESTORE });
-            if !cfg!(test) {
-                SetForegroundWindow(self.panel);
+            if !self.awaiting_first_pass {
+                ShowWindow(self.panel, if cfg!(test) { SW_HIDE } else { SW_RESTORE });
+                if !cfg!(test) {
+                    SetForegroundWindow(self.panel);
+                }
             }
         }
         self.publish_view();
@@ -2092,6 +2478,11 @@ impl App {
     fn close_panel(&mut self) {
         self.cancel_support();
         self.close_picker();
+        self.remember_panel_position();
+        self.awaiting_first_pass = false;
+        unsafe {
+            KillTimer(self.hwnd, REVEAL_TIMER);
+        }
         let panel = std::mem::replace(&mut self.panel, null_mut());
         if !panel.is_null() {
             unsafe {
@@ -2115,6 +2506,36 @@ impl App {
         let previous = self.manager.clone();
         match id {
             BACK => self.switch_page(Page::Main),
+            HISTORY => self.switch_page(Page::History),
+            WINDOW_PIN => {
+                self.manager.window_pinned = !self.manager.window_pinned;
+                self.persist();
+                // Pinning snaps the window back to the corner immediately;
+                // unpinning leaves it where it is so it can be dragged.
+                if self.manager.window_pinned {
+                    self.apply_panel_position();
+                }
+            }
+            ALL_SWITCHES => {
+                // Flip every device the settings list shows. A mixed state turns
+                // everything on, which is what a half-lit master switch promises.
+                let target = !self.all_switches_on();
+                for state in &mut self.manager.devices {
+                    if state.selected && !state.removed {
+                        state.show_tray = target;
+                        state.notify = target;
+                    }
+                }
+                self.persist();
+                unsafe {
+                    for row in &self.rows {
+                        for control in row.switches() {
+                            SendMessageW(control, BM_SETCHECK, usize::from(target), 0);
+                        }
+                    }
+                }
+                self.update_icons(false);
+            }
             PICK_REFRESH => {
                 self.picker_ids = self
                     .manager
@@ -2147,7 +2568,9 @@ impl App {
                         i32::from(self.manager.notifications_enabled),
                     );
                     for row in &self.rows {
-                        EnableWindow(row.refresh, i32::from(self.manager.notifications_enabled));
+                        if !row.notify.is_null() {
+                            EnableWindow(row.notify, i32::from(self.manager.notifications_enabled));
+                        }
                     }
                 }
             }
@@ -2165,45 +2588,33 @@ impl App {
                     );
                 }
             }
-            id if (SETTINGS_BASE..ADD_BASE).contains(&id) => {
-                let index = ((id - SETTINGS_BASE) / 3) as usize;
-                let action = (id - SETTINGS_BASE) % 3;
-                if let Some(row) = self.rows.get(index) {
-                    let device_id = row.id.clone();
-                    if action == 0 {
-                        self.manager.toggle_tray(&device_id);
-                    } else if action == 1 {
-                        if let Some(s) = self
-                            .manager
-                            .devices
-                            .iter_mut()
-                            .find(|s| s.descriptor.id == device_id)
-                        {
-                            s.notify = !s.notify;
-                        }
-                    } else {
-                        self.manager.remove(&device_id);
-                    }
-                    self.persist();
-                    self.rebuild_rows();
-                    self.update_icons(false);
-                }
-            }
             id if id >= ADD_BASE => {
-                let index = ((id - ADD_BASE) / 3) as usize;
-                let action = (id - ADD_BASE) % 3;
+                let index = ((id - ADD_BASE) / ADD_STRIDE) as usize;
+                let action = (id - ADD_BASE) % ADD_STRIDE;
                 if let Some(row) = self.rows.get(index) {
                     let device_id = row.id.clone();
-                    if action != 0 {
-                        self.request_support(&device_id, action == 2);
-                    } else if self.manager.devices.iter().any(|s| {
-                        s.descriptor.id == device_id && s.descriptor.supported && !s.selected
-                    }) {
-                        self.manager.select(&device_id);
-                        self.persist();
-                        self.update_icons(false);
-                        self.publish_view();
-                        self.refresh_ids(vec![device_id]);
+                    match action {
+                        0 => {
+                            if self.manager.devices.iter().any(|s| {
+                                s.descriptor.id == device_id
+                                    && s.descriptor.supported
+                                    && !s.selected
+                            }) {
+                                self.manager.select(&device_id);
+                                self.persist();
+                                self.update_icons(false);
+                                self.publish_view();
+                                self.refresh_ids(vec![device_id]);
+                            }
+                        }
+                        1 => self.request_support(&device_id, false),
+                        _ => {
+                            // Removal moved here from the settings list.
+                            self.manager.remove(&device_id);
+                            self.persist();
+                            self.rebuild_rows();
+                            self.update_icons(false);
+                        }
                     }
                 }
             }
@@ -2222,62 +2633,245 @@ impl App {
         self.sync_preferences();
         self.publish_view();
     }
+    /// A per-device switch on the main page. The button already flipped itself,
+    /// so the stored preference follows the click and a rejected write puts both
+    /// the model and the button back.
+    fn main_switch(&mut self, index: usize, action: usize) {
+        let Some(device_id) = self.rows.get(index).map(|row| row.id.clone()) else {
+            return;
+        };
+        let previous = self.manager.clone();
+        if action == 0 {
+            self.manager.toggle_tray(&device_id);
+        } else if let Some(state) = self
+            .manager
+            .devices
+            .iter_mut()
+            .find(|s| s.descriptor.id == device_id)
+        {
+            state.notify = !state.notify;
+        }
+        self.persist();
+        if let Some(error) = self.manager.persistence_error.clone() {
+            self.manager = previous;
+            self.manager.persistence_error = Some(error.clone());
+            self.sync_preferences();
+            self.operation_error(&format!("无法保存设置：{error}"));
+            return;
+        }
+        self.update_icons(false);
+        self.sync_preferences();
+        self.publish_view();
+    }
+    /// Idle means no keyboard or mouse input has reached this window for a
+    /// while. Both background timers slow down then, and a single key press
+    /// brings the active cadence back immediately.
+    fn idle(&self) -> bool {
+        Instant::now()
+            .saturating_duration_since(self.bridge.activity_seen.get())
+            .as_secs()
+            >= manager::IDLE_AFTER_SECONDS
+    }
     /// The refresh cadence is owned by the tray window timer, so every settings
     /// change has to restate it. Disabling the setting stops the periodic pass
-    /// entirely instead of leaving a hidden timer running.
+    /// entirely instead of leaving a hidden timer running. The interval itself
+    /// comes from the manager — stored value plus the adaptive rules — and an
+    /// unchanged interval leaves the running countdown alone.
     fn apply_refresh_timer(&self) -> bool {
         if self.hwnd.is_null() {
             return false;
         }
+        if !self.manager.auto_refresh {
+            unsafe {
+                KillTimer(self.hwnd, 1);
+            }
+            self.refresh_timer_seconds.set(0);
+            return true;
+        }
+        let seconds = self.manager.refresh_cadence(self.idle());
+        if self.refresh_timer_seconds.get() == seconds {
+            return true;
+        }
         unsafe {
             KillTimer(self.hwnd, 1);
-            if !self.manager.auto_refresh {
-                return true;
+            let millis = seconds.saturating_mul(1000).max(30_000);
+            if SetTimer(self.hwnd, 1, millis, None) == 0 {
+                return false;
             }
-            let millis = self
-                .manager
-                .refresh_seconds
-                .saturating_mul(1000)
-                .max(30_000);
-            SetTimer(self.hwnd, 1, millis, None) != 0
         }
+        self.refresh_timer_seconds.set(seconds);
+        true
     }
-    fn sync_preferences(&self) {
-        if self.panel.is_null() || self.page != Page::Settings {
+    /// Re-arms the link-check timer from the state this session is in now. Only
+    /// a changed cadence touches the timer: an unchanged one keeps counting, so
+    /// continuous input cannot starve the probe. Input arriving after an idle
+    /// stretch does change it, which restores the active cadence immediately.
+    fn apply_presence_timer(&self) -> bool {
+        if self.hwnd.is_null() {
+            return false;
+        }
+        let seconds = self.manager.presence_cadence(self.idle());
+        if self.presence_timer_seconds.get() == seconds {
+            return true;
+        }
+        let armed = unsafe {
+            SetTimer(
+                self.hwnd,
+                PRESENCE_TIMER,
+                seconds.saturating_mul(1000),
+                None,
+            ) != 0
+        };
+        if armed {
+            self.presence_timer_seconds.set(seconds);
+        }
+        armed
+    }
+    /// Put the panel where it belongs: the remembered left edge and the bottom
+    /// it rested on, or — the first time — centred horizontally on the work-area
+    /// bottom, the way the clock flyout hangs off the taskbar. A remembered spot
+    /// that no longer touches a monitor is dropped instead of stranding it.
+    fn apply_panel_position(&self) {
+        if self.panel.is_null() {
             return;
         }
         unsafe {
-            for (id, checked) in [
-                (ALERTS, self.manager.notifications_enabled),
-                (CONNECTIONS, self.manager.connection_notifications),
-                (AUTO_REFRESH, self.manager.auto_refresh),
-            ] {
-                SendMessageW(
-                    GetDlgItem(self.panel, id as i32),
-                    BM_SETCHECK,
-                    usize::from(checked),
-                    0,
-                );
+            let mut rect: RECT = std::mem::zeroed();
+            if GetWindowRect(self.panel, &mut rect) == 0 {
+                return;
             }
-            EnableWindow(
-                GetDlgItem(self.panel, THRESHOLD as i32),
-                i32::from(self.manager.notifications_enabled),
-            );
-            EnableWindow(
-                GetDlgItem(self.panel, REFRESH_INTERVAL as i32),
-                i32::from(self.manager.auto_refresh),
-            );
-            for row in &self.rows {
-                if let Some(state) = self
-                    .manager
-                    .devices
-                    .iter()
-                    .find(|s| s.descriptor.id == row.id)
-                {
-                    SendMessageW(row.percent, BM_SETCHECK, usize::from(state.show_tray), 0);
-                    SendMessageW(row.refresh, BM_SETCHECK, usize::from(state.notify), 0);
-                    EnableWindow(row.refresh, i32::from(self.manager.notifications_enabled));
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            // Pinned: the bottom-right corner of the monitor under the pointer,
+            // the way the shell's own flyouts sit above the tray. Unpinned: the
+            // spot the window was dragged to, and that corner when there is none.
+            let corner = || {
+                let mut cursor = POINT { x: 0, y: 0 };
+                if GetCursorPos(&mut cursor) == 0 {
+                    cursor = POINT { x: 0, y: 0 };
                 }
+                let work = work_area_at(cursor);
+                ((work.right - width).max(work.left), work.bottom)
+            };
+            let (left, bottom) = if self.manager.window_pinned {
+                corner()
+            } else {
+                self.manager
+                    .panel_anchor
+                    .filter(|(left, bottom)| anchor_on_some_monitor(*left, *bottom, width))
+                    .unwrap_or_else(corner)
+            };
+            // Clamp against the monitor that holds the anchor, then derive the
+            // top from the bottom edge: a taller page grows upwards.
+            let work = work_area_at(POINT {
+                x: left,
+                y: (bottom - 1).max(0),
+            });
+            let left = left.clamp(work.left, (work.right - width).max(work.left));
+            let bottom = bottom.clamp(work.top, work.bottom);
+            let top = (bottom - height).max(work.top);
+            SetWindowPos(
+                self.panel,
+                null_mut(),
+                left,
+                top,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+    /// Show the panel once the row count is settled: after the first discovery
+    /// pass, or after the 500 ms guard if the worker is slow. Called twice is
+    /// harmless — the second call returns immediately.
+    fn reveal_panel(&mut self) {
+        unsafe {
+            KillTimer(self.hwnd, REVEAL_TIMER);
+        }
+        if !self.awaiting_first_pass {
+            return;
+        }
+        self.awaiting_first_pass = false;
+        if self.panel.is_null() {
+            return;
+        }
+        self.layout_panel();
+        if !cfg!(test) {
+            unsafe {
+                ShowWindow(self.panel, SW_RESTORE);
+                SetForegroundWindow(self.panel);
+            }
+        }
+    }
+    /// Remember the left edge and the bottom edge for the next run. Called
+    /// before the window is destroyed, so a moved window survives a restart.
+    fn remember_panel_position(&mut self) {
+        if self.panel.is_null() || self.manager.window_pinned {
+            return;
+        }
+        unsafe {
+            let mut rect: RECT = std::mem::zeroed();
+            if GetWindowRect(self.panel, &mut rect) == 0 {
+                return;
+            }
+            let anchor = Some((rect.left, rect.bottom));
+            if self.manager.panel_anchor != anchor {
+                self.manager.panel_anchor = anchor;
+                self.persist();
+            }
+        }
+    }
+    fn sync_preferences(&self) {
+        if self.panel.is_null() {
+            return;
+        }
+        unsafe {
+            match self.page {
+                Page::Settings => {
+                    for (id, checked) in [
+                        (ALERTS, self.manager.notifications_enabled),
+                        (CONNECTIONS, self.manager.connection_notifications),
+                        (AUTO_REFRESH, self.manager.auto_refresh),
+                        (WINDOW_PIN, self.manager.window_pinned),
+                    ] {
+                        SendMessageW(
+                            GetDlgItem(self.panel, id as i32),
+                            BM_SETCHECK,
+                            usize::from(checked),
+                            0,
+                        );
+                    }
+                    EnableWindow(
+                        GetDlgItem(self.panel, THRESHOLD as i32),
+                        i32::from(self.manager.notifications_enabled),
+                    );
+                    EnableWindow(
+                        GetDlgItem(self.panel, REFRESH_INTERVAL as i32),
+                        i32::from(self.manager.auto_refresh),
+                    );
+                    self.sync_all_switch();
+                }
+                Page::Main => {
+                    for row in &self.rows {
+                        let Some(state) = self
+                            .manager
+                            .devices
+                            .iter()
+                            .find(|s| s.descriptor.id == row.id)
+                        else {
+                            continue;
+                        };
+                        if !row.tray.is_null() {
+                            SendMessageW(row.tray, BM_SETCHECK, usize::from(state.show_tray), 0);
+                        }
+                        if !row.notify.is_null() {
+                            SendMessageW(row.notify, BM_SETCHECK, usize::from(state.notify), 0);
+                            EnableWindow(row.notify, i32::from(self.manager.notifications_enabled));
+                        }
+                    }
+                }
+                // Read-only pages keep no switches to synchronise.
+                Page::Add | Page::History => {}
             }
         }
     }
@@ -2314,7 +2908,12 @@ impl App {
     }
     fn focus_target(&mut self, hwnd: HWND, index: Option<usize>) {
         let item = index
-            .map(|index| (self.row_top() - self.viewport_top() + index as i32 * 64, 56))
+            .map(|index| {
+                (
+                    self.row_top() - self.viewport_top() + index as i32 * ROW_HEIGHT,
+                    56,
+                )
+            })
             .or_else(|| {
                 if self.page == Page::Settings {
                     match unsafe { GetDlgCtrlID(hwnd) } as u32 {
@@ -2533,6 +3132,10 @@ impl App {
                 UiEvent::Result => self.receive(),
                 UiEvent::Heartbeat => {
                     self.receive();
+                    // A new reading can move the cadence (a pack inside the
+                    // alert band, or the session having gone idle). Restating it
+                    // here costs nothing while the interval is unchanged.
+                    self.apply_refresh_timer();
                     self.update_icons(false);
                     if !self.manager.pending_alerts.is_empty() {
                         self.persist();
@@ -2544,10 +3147,20 @@ impl App {
                     self.publish_view();
                 }
                 UiEvent::Refresh => self.refresh(true),
-                UiEvent::Presence => self.presence(),
+                UiEvent::Presence => {
+                    self.presence();
+                    // The tick just observed the session state, so this is the
+                    // right moment to decide how long the next gap should be.
+                    self.apply_presence_timer();
+                }
                 UiEvent::Discover => self.discover(),
                 UiEvent::Activity => {
                     self.bridge.activity_queued.set(false);
+                    // Input ends an idle stretch: the next link check is due in
+                    // the active interval again, and the fallback poll returns to
+                    // the active cadence too.
+                    self.apply_presence_timer();
+                    self.apply_refresh_timer();
                     if self.last_activity_refresh.elapsed().as_secs() >= 10 {
                         self.last_activity_refresh = Instant::now();
                         self.refresh(false);
@@ -2566,7 +3179,14 @@ impl App {
                     self.interval_error = false;
                     self.publish_view();
                 }
-                UiEvent::ShowPanel => self.show_panel(),
+                UiEvent::RevealPanel => self.reveal_panel(),
+                UiEvent::TogglePanel => {
+                    if self.panel.is_null() {
+                        self.show_panel();
+                    } else {
+                        self.close_panel();
+                    }
+                }
                 UiEvent::ClosePanel => self.close_panel(),
                 UiEvent::RowRefresh(id) => {
                     if self.manager.selected().any(|s| s.descriptor.id == id) {
@@ -2576,11 +3196,15 @@ impl App {
                 UiEvent::DeviceCommand(page, action, id) => {
                     if self.page == page {
                         if let Some(index) = self.rows.iter().position(|r| r.id == id) {
-                            self.page_command(if page == Page::Settings {
-                                SETTINGS_BASE + index as u32 * 3 + action
-                            } else {
-                                ADD_BASE + index as u32 * 3 + action
-                            });
+                            match page {
+                                Page::Main => self.main_switch(index, action as usize),
+                                Page::Settings | Page::History => {}
+                                Page::Add => {
+                                    self.page_command(
+                                        ADD_BASE + index as u32 * ADD_STRIDE + action,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -2659,6 +3283,11 @@ impl App {
         if !self.panel.is_null() {
             self.rebuild_rows_with(true);
             self.layout_panel();
+            // The panel's own pixels are painted from `panel_colors()`, not from
+            // any child, so a theme change has to invalidate it explicitly.
+            unsafe {
+                InvalidateRect(self.panel, null(), 1);
+            }
         }
     }
     fn quit(&mut self) {
@@ -2781,6 +3410,27 @@ struct PanelColors {
     outline: u32,
     high_contrast: bool,
 }
+/// Whether the shell follows the light theme. Windows stores this per user and
+/// only broadcasts a change; a plain Win32 window does not switch by itself, so
+/// the shell reads the same value the clock flyout does.
+fn system_uses_light_theme() -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    let mut light: u32 = 1;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize").as_ptr(),
+            wide("AppsUseLightTheme").as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&mut light as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    // A missing value means light: that is the Windows 10 default.
+    result != windows_sys::Win32::Foundation::ERROR_SUCCESS || light != 0
+}
 fn panel_colors() -> PanelColors {
     // HIGHCONTRASTW is this stable native structure; no extra Win32 feature is needed.
     #[repr(C)]
@@ -2815,7 +3465,7 @@ fn panel_colors() -> PanelColors {
                 high_contrast: true,
             }
         }
-    } else {
+    } else if system_uses_light_theme() {
         PanelColors {
             paper: 0x00f5f8fa,
             text: 0x00292d30,
@@ -2823,6 +3473,18 @@ fn panel_colors() -> PanelColors {
             fill: 0x003e59a9,
             empty: 0x00cbd7df,
             outline: 0x00646e75,
+            high_contrast: false,
+        }
+    } else {
+        // The Windows 10 clock flyout's own palette, so the panel sits next to
+        // it without looking like a different era.
+        PanelColors {
+            paper: 0x001f1f1f,
+            text: 0x00f2f2f2,
+            secondary: 0x00a0a0a0,
+            fill: 0x00d47800,
+            empty: 0x003a3a3a,
+            outline: 0x005a5a5a,
             high_contrast: false,
         }
     }
@@ -3005,20 +3667,27 @@ unsafe fn use_panel_coordinates(dc: HDC, hwnd: HWND) {
         SetBkMode(dc, TRANSPARENT as i32);
     }
 }
-unsafe fn focus_cues_visible(hwnd: HWND) -> bool {
-    unsafe {
-        let root = GetAncestor(hwnd, GA_ROOT);
-        let root = if root.is_null() { hwnd } else { root };
-        SendMessageW(root, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize == 0
-    }
+thread_local! {
+    /// Whether keyboard focus cues are drawn. Windows keeps this in a per-window
+    /// UI state that `WM_CHANGEUISTATE` only applies when it feels like it: this
+    /// shell is a plain window, not a dialog, and on this machine the request is
+    /// dropped — which left a 250px focus ring behind after every mouse click on
+    /// a switch. The shell therefore owns the flag and mirrors the request to the
+    /// system for the native parts it does honour.
+    static FOCUS_CUES: Cell<bool> = const { Cell::new(true) };
+}
+fn focus_cues_visible() -> bool {
+    FOCUS_CUES.with(Cell::get)
 }
 unsafe fn set_focus_cues(hwnd: HWND, visible: bool) {
     unsafe {
-        let root = GetAncestor(hwnd, GA_ROOT);
-        let root = if root.is_null() { hwnd } else { root };
-        if focus_cues_visible(root) == visible {
+        if FOCUS_CUES.with(|cues| cues.replace(visible)) == visible {
             return;
         }
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let root = if root.is_null() { hwnd } else { root };
+        // Mirror it for the native controls: whether the system applies this is
+        // optional, agreeing with our own flag is not.
         let action = if visible { UIS_CLEAR } else { UIS_SET };
         SendMessageW(
             root,
@@ -3039,6 +3708,33 @@ unsafe fn input_focus_cues(panel: HWND, message: &MSG) {
             WM_KEYDOWN if matches!(message.wParam, 9 | 13 | 32) => set_focus_cues(panel, true),
             _ => {}
         }
+    }
+}
+/// Work area of the monitor holding `point`, falling back to the primary one.
+unsafe fn work_area_at(point: POINT) -> RECT {
+    unsafe {
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTOPRIMARY);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if !monitor.is_null() && GetMonitorInfoW(monitor, &mut info) != 0 {
+            return info.rcWork;
+        }
+        let mut work: RECT = std::mem::zeroed();
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut work as *mut RECT).cast(), 0);
+        work
+    }
+}
+/// True when an anchor at `(left, bottom)` still leaves a reachable corner on a
+/// monitor that exists right now — a spot on an unplugged screen does not.
+unsafe fn anchor_on_some_monitor(left: i32, bottom: i32, width: i32) -> bool {
+    unsafe {
+        let probe = RECT {
+            left,
+            right: left + width.min(160),
+            top: bottom - 48,
+            bottom,
+        };
+        !MonitorFromRect(&probe, MONITOR_DEFAULTTONULL).is_null()
     }
 }
 unsafe fn panel_text(dc: HDC, text: &str, bounds: RECT, height: i32, weight: i32, format: u32) {
@@ -3148,19 +3844,13 @@ unsafe fn draw_control_colors(hwnd: HWND, checkbox: bool, dc: HDC, colors: &Pane
                 colors.secondary
             },
         );
-        let fill = CreateSolidBrush(if pushed { colors.empty } else { colors.paper });
-        let border = CreatePen(PS_SOLID, 1, colors.outline);
-        let old_pen = SelectObject(dc, border);
-        let old_brush = SelectObject(dc, fill);
-        SelectObject(dc, GetStockObject(DC_PEN));
-        SelectObject(dc, GetStockObject(DC_BRUSH));
-        let label = bounds;
         let control_id = GetDlgCtrlID(hwnd) as u32;
         let mut text = [0u16; 512];
         let len = GetWindowTextW(hwnd, text.as_mut_ptr(), 512);
         let text = String::from_utf16_lossy(&text[..len as usize]);
         let control_state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const StyledControl;
         let hovered = enabled && !control_state.is_null() && (*control_state).hovered.get();
+        let scale = dpi as f32 / 96.0;
         if checkbox {
             let checked = SendMessageW(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
             let x = if bounds.right > 100 {
@@ -3169,32 +3859,20 @@ unsafe fn draw_control_colors(hwnd: HWND, checkbox: bool, dc: HDC, colors: &Pane
                 (bounds.right - 38) / 2
             };
             let y = (bounds.bottom - 22) / 2;
-            SetDCPenColor(
-                dc,
-                if checked && enabled {
-                    colors.fill
-                } else {
-                    colors.outline
-                },
-            );
-            SetDCBrushColor(
-                dc,
-                if checked && enabled {
-                    colors.fill
-                } else {
-                    colors.outline
-                },
-            );
-            RoundRect(dc, x, y, x + 38, y + 22, 22, 22);
+            let track = if checked && enabled {
+                colors.fill
+            } else {
+                colors.outline
+            };
             let knob_color = if checked && enabled && colors.high_contrast {
                 GetSysColor(COLOR_HIGHLIGHTTEXT)
             } else {
                 colors.paper
             };
-            SetDCPenColor(dc, knob_color);
-            SetDCBrushColor(dc, knob_color);
-            let knob = if checked { x + 20 } else { x + 3 };
-            Ellipse(dc, knob, y + 3, knob + 16, y + 19);
+            // A GDI RoundRect with radius 22 on a 22-tall track collapses into
+            // an aliased octagon, so the track and knob are composited at
+            // device resolution instead.
+            draw_toggle(dc, dpi, x, y, checked, track, knob_color);
             if bounds.right > 100 {
                 SetTextColor(
                     dc,
@@ -3219,18 +3897,24 @@ unsafe fn draw_control_colors(hwnd: HWND, checkbox: bool, dc: HDC, colors: &Pane
                 );
             }
         } else {
-            let primary = control_id >= ADD_BASE && (control_id - ADD_BASE) % 3 == 0;
+            let primary = control_id >= ADD_BASE && (control_id - ADD_BASE) % ADD_STRIDE == 0;
             if primary || hovered || pushed {
-                SetDCPenColor(dc, if primary { colors.fill } else { colors.empty });
-                SetDCBrushColor(
+                blend_round_rect(
                     dc,
-                    if primary && enabled {
+                    Rect::new(
+                        scale,
+                        scale,
+                        (bounds.right - 1) as f32 * scale,
+                        (bounds.bottom - 1) as f32 * scale,
+                    ),
+                    RADIUS_CONTROL * scale,
+                    Some(if primary && enabled {
                         colors.fill
                     } else {
                         colors.empty
-                    },
+                    }),
+                    Some((if primary { colors.fill } else { colors.empty }, scale)),
                 );
-                RoundRect(dc, 1, 1, bounds.right - 1, bounds.bottom - 1, 7, 7);
             }
             SetTextColor(
                 dc,
@@ -3248,9 +3932,7 @@ unsafe fn draw_control_colors(hwnd: HWND, checkbox: bool, dc: HDC, colors: &Pane
             );
             let visible = if control_id == BACK {
                 "←"
-            } else if (SETTINGS_BASE..ADD_BASE).contains(&control_id)
-                && (control_id - SETTINGS_BASE) % 3 == 2
-            {
+            } else if control_id >= ADD_BASE && (control_id - ADD_BASE) % ADD_STRIDE == 2 {
                 "移除"
             } else {
                 &text
@@ -3258,28 +3940,110 @@ unsafe fn draw_control_colors(hwnd: HWND, checkbox: bool, dc: HDC, colors: &Pane
             panel_text(
                 dc,
                 visible,
-                label,
-                if control_id == BACK { 22 } else { 15 },
+                bounds,
+                if control_id == BACK {
+                    22
+                } else if control_id == HISTORY {
+                    // Same size as the column captions it sits beside, so the
+                    // header row reads as one band instead of three sizes.
+                    11
+                } else {
+                    15
+                },
                 400,
                 DT_VCENTER | DT_CENTER,
             );
         }
-        if focused && focus_cues_visible(hwnd) {
-            let focus = CreatePen(PS_SOLID, 2, colors.fill);
-            let prior = SelectObject(dc, focus);
-            let prior_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            RoundRect(dc, 2, 2, bounds.right - 2, bounds.bottom - 2, 6, 6);
-            SelectObject(dc, prior_brush);
-            SelectObject(dc, prior);
-            DeleteObject(focus);
+        if focused && focus_cues_visible() {
+            blend_round_rect(
+                dc,
+                Rect::new(
+                    2.0 * scale,
+                    2.0 * scale,
+                    (bounds.right - 2) as f32 * scale,
+                    (bounds.bottom - 2) as f32 * scale,
+                ),
+                RADIUS_CONTROL * scale,
+                None,
+                Some((colors.fill, 2.0 * scale)),
+            );
         }
-        SelectObject(dc, old_pen);
-        SelectObject(dc, old_brush);
-        DeleteObject(border);
-        DeleteObject(fill);
         DeleteObject(paper);
         RestoreDC(dc, saved);
     }
+}
+
+/// Light `RoundRect` replacement: the shape is rasterized into an antialiased
+/// surface at device resolution and blended, so a 1px border stays one crisp
+/// pixel on the grid instead of GDI's fractional, jagged strokes.
+fn blend_round_rect(
+    dc: HDC,
+    rect: Rect,
+    radius: f32,
+    fill: Option<u32>,
+    stroke: Option<(u32, f32)>,
+) {
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let pad = 1.0;
+    let origin_x = rect.left - pad;
+    let origin_y = rect.top - pad;
+    let mut surface = Surface::new(
+        (rect.right - rect.left + pad * 2.0).ceil() as usize,
+        (rect.bottom - rect.top + pad * 2.0).ceil() as usize,
+    );
+    let local = Rect::new(
+        pad,
+        pad,
+        rect.right - rect.left + pad,
+        rect.bottom - rect.top + pad,
+    );
+    match (fill, stroke) {
+        (None, None) => {}
+        (Some(color), None) => {
+            surface.fill_round_rect(local, radius, color);
+        }
+        (None, Some((color, width))) => {
+            surface.stroke_round_rect(local, radius, width, color);
+        }
+        (Some(color), Some((edge, width))) => {
+            // The ring is painted first, then the interior is restored so the
+            // fill colour survives the inside stroke.
+            surface.fill_round_rect(local, radius, edge);
+            surface.fill_round_rect(local.inset(width), (radius - width).max(0.0), color);
+        }
+    }
+    surface.blend_onto(dc, origin_x.round() as i32, origin_y.round() as i32);
+}
+
+/// 38x22 logical switch: a true pill track with a 16px knob inset 3px on the
+/// active side. Both shapes are antialiased circles, so the knob sits evenly
+/// at either end instead of the old 3px/2px mismatch.
+fn draw_toggle(dc: HDC, dpi: i32, x: i32, y: i32, checked: bool, track: u32, knob: u32) {
+    let scale = dpi as f32 / 96.0;
+    let width = 38.0 * scale;
+    let height = 22.0 * scale;
+    let diameter = 16.0 * scale;
+    let inset = 3.0 * scale;
+    let mut surface = Surface::new(width.ceil() as usize, height.ceil() as usize);
+    surface.fill_round_rect(Rect::new(0.0, 0.0, width, height), height * 0.5, track);
+    let left = if checked {
+        width - inset - diameter
+    } else {
+        inset
+    };
+    let top = (height - diameter) * 0.5;
+    surface.fill_circle(
+        (left + diameter * 0.5, top + diameter * 0.5),
+        diameter * 0.5,
+        knob,
+    );
+    surface.blend_onto(
+        dc,
+        (x as f32 * scale).round() as i32,
+        (y as f32 * scale).round() as i32,
+    );
 }
 
 unsafe extern "system" fn window_proc(
@@ -3338,6 +4102,7 @@ unsafe extern "system" fn window_proc(
         RESULT => UiEvent::Result,
         WM_TIMER if wparam == 2 => UiEvent::Heartbeat,
         WM_TIMER if wparam == PRESENCE_TIMER => UiEvent::Presence,
+        WM_TIMER if wparam == REVEAL_TIMER => UiEvent::RevealPanel,
         WM_TIMER => UiEvent::Discover,
         WM_DEVICECHANGE => UiEvent::Discover,
         WM_INPUT => {
@@ -3363,7 +4128,9 @@ unsafe extern "system" fn window_proc(
         TRAY if lparam as u32 == WM_RBUTTONUP || lparam as u32 == WM_CONTEXTMENU => {
             UiEvent::Menu(Instant::now(), wparam as u32)
         }
-        TRAY if lparam as u32 == WM_LBUTTONUP => UiEvent::ShowPanel,
+        // A frameless panel has no close button of its own, so the tray icon
+        // does what the clock does: the same click that opens it closes it.
+        TRAY if lparam as u32 == WM_LBUTTONUP => UiEvent::TogglePanel,
         WM_CLOSE => UiEvent::Control(QUIT),
         WM_DESTROY => UiEvent::MainDestroyed,
         WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DISPLAYCHANGE => UiEvent::SettingsChanged,
@@ -3422,24 +4189,32 @@ unsafe extern "system" fn panel_proc(
         WM_COMMAND if (wparam >> 16) as u32 == BN_CLICKED => match (wparam & 0xffff) as u32 {
             ADD => UiEvent::Control(ADD as usize),
             SETTINGS => UiEvent::Settings,
-            id if id >= SETTINGS_BASE => {
+            id if (MAIN_TRAY_BASE..MAIN_TRAY_BASE + 512).contains(&id) => {
                 let view = bridge.view.borrow();
-                let (index, action) = if id >= ADD_BASE {
-                    (((id - ADD_BASE) / 3) as usize, (id - ADD_BASE) % 3)
-                } else {
-                    (
-                        ((id - SETTINGS_BASE) / 3) as usize,
-                        (id - SETTINGS_BASE) % 3,
-                    )
+                let Some(row) = view.rows.get((id - MAIN_TRAY_BASE) as usize) else {
+                    return 0;
                 };
+                UiEvent::DeviceCommand(Page::Main, 0, row.descriptor.id.clone())
+            }
+            id if (MAIN_NOTIFY_BASE..MAIN_NOTIFY_BASE + 512).contains(&id) => {
+                let view = bridge.view.borrow();
+                let Some(row) = view.rows.get((id - MAIN_NOTIFY_BASE) as usize) else {
+                    return 0;
+                };
+                UiEvent::DeviceCommand(Page::Main, 1, row.descriptor.id.clone())
+            }
+            id if id >= ADD_BASE => {
+                let view = bridge.view.borrow();
+                let index = ((id - ADD_BASE) / ADD_STRIDE) as usize;
+                let action = (id - ADD_BASE) % ADD_STRIDE;
                 let Some(row) = view.rows.get(index) else {
                     return 0;
                 };
                 UiEvent::DeviceCommand(view.page, action, row.descriptor.id.clone())
             }
-            BACK | STARTUP | ALERTS | CONNECTIONS | AUTO_REFRESH | PICK_REFRESH => {
-                UiEvent::PageCommand((wparam & 0xffff) as u32)
-            }
+            BACK | STARTUP | ALERTS | CONNECTIONS | AUTO_REFRESH | PICK_REFRESH | HISTORY
+            | WINDOW_PIN => UiEvent::PageCommand((wparam & 0xffff) as u32),
+            ALL_SWITCHES => UiEvent::PageCommand(ALL_SWITCHES),
             id if id >= ROW_BASE && (id - ROW_BASE) % 3 == 2 => {
                 let view = bridge.view.borrow();
                 let Some(row) = view.rows.get(((id - ROW_BASE) / 3) as usize) else {
@@ -3484,11 +4259,11 @@ unsafe extern "system" fn panel_proc(
         }
         WM_VSCROLL => UiEvent::Scroll(match (wparam & 0xffff) as i32 {
             SB_LINEUP => -64,
-            SB_LINEDOWN => 64,
-            SB_PAGEUP => -192,
-            SB_PAGEDOWN => 192,
+            SB_LINEDOWN => ROW_HEIGHT,
+            SB_PAGEUP => -ROW_HEIGHT * 3,
+            SB_PAGEDOWN => ROW_HEIGHT * 3,
             SB_THUMBTRACK | SB_THUMBPOSITION => {
-                ((wparam >> 16) as i32 / 64) * 64 - bridge.view.borrow().scroll
+                ((wparam >> 16) as i32 / ROW_HEIGHT) * ROW_HEIGHT - bridge.view.borrow().scroll
             }
             _ => 0,
         }),
@@ -3513,6 +4288,26 @@ unsafe extern "system" fn panel_proc(
             return 0;
         }
         WM_DPICHANGED => UiEvent::DpiChanged(hwnd, unsafe { *(lparam as *const RECT) }),
+        // The caption is gone, so the header band is the drag handle. Child
+        // controls (the back arrow, the history link) keep their own hit test.
+        WM_NCHITTEST => {
+            let mut point = POINT {
+                x: (lparam & 0xffff) as i16 as i32,
+                y: ((lparam >> 16) & 0xffff) as i16 as i32,
+            };
+            unsafe {
+                ScreenToClient(hwnd, &mut point);
+            }
+            let view = bridge.view.borrow();
+            let band = if view.page == Page::Main { 68 } else { 56 };
+            // A pinned panel is not a handle: dragging it would only fight the
+            // corner it is nailed to.
+            if !view.pinned && point.y < band {
+                return HTCAPTION as isize;
+            }
+            drop(view);
+            return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+        }
         WM_SETTINGCHANGE | WM_THEMECHANGED => UiEvent::SettingsChanged,
         WM_CTLCOLORBTN | WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
             let colors = panel_colors();
@@ -3540,31 +4335,62 @@ fn cell_fill(percent: Option<u8>, cell: i32) -> i32 {
 }
 unsafe fn draw_battery(
     dc: HDC,
+    dpi: i32,
     left: i32,
     y: i32,
     reading: Option<&Reading>,
     colors: &PanelColors,
 ) {
     unsafe {
-        SetDCPenColor(dc, colors.outline);
-        SetDCBrushColor(dc, colors.paper);
-        RoundRect(dc, left, y + 16, left + 127, y + 40, 3, 3);
-        SetDCBrushColor(dc, colors.outline);
-        Rectangle(dc, left + 129, y + 23, left + 132, y + 33);
+        let scale = dpi as f32 / 96.0;
+        // Body, terminal, cells and bolt share one device-resolution surface:
+        // GDI's Rectangle/RoundRect/Polygon alias and land on fractional
+        // pixels as soon as the panel mapping leaves 96 dpi.
+        let origin_x = (left as f32 - 1.0) * scale;
+        let origin_y = (y as f32 + 14.0) * scale;
+        let mut surface = Surface::new(
+            (133.0 * scale).ceil() as usize,
+            (29.0 * scale).ceil() as usize,
+        );
+        let px = |value: i32| (value - left + 1) as f32 * scale;
+        let py = |value: i32| (value - y - 14) as f32 * scale;
+        let edge = scale.max(1.0);
+        let radius = RADIUS_BATTERY * scale;
+        // Ten cells on an 11px pitch keep the gauge inside the narrower column.
+        let body = Rect::new(px(left), py(y + 16), px(left + 107), py(y + 40));
+        surface.fill_round_rect(body, radius, colors.outline);
+        surface.fill_round_rect(body.inset(edge), (radius - edge).max(0.0), colors.paper);
+        surface.fill_rect(
+            Rect::new(px(left + 109), py(y + 23), px(left + 113), py(y + 34)),
+            colors.outline,
+        );
         if let Some(reading) = reading {
             for cell in 0..10 {
-                let x = left + 4 + cell * 12;
-                SetDCBrushColor(dc, colors.empty);
-                SetDCPenColor(dc, colors.empty);
-                Rectangle(dc, x, y + 20, x + 10, y + 36);
+                let x = left + 4 + cell * 10;
+                let background = Rect::new(px(x), py(y + 20), px(x + 9), py(y + 37));
+                surface.fill_rect(background, colors.empty);
                 let fill = cell_fill(Some(reading.normalized_percent()), cell);
                 if fill > 0 {
-                    SetDCBrushColor(dc, colors.fill);
-                    SetDCPenColor(dc, colors.fill);
-                    Rectangle(dc, x, y + 20, x + fill, y + 36);
+                    surface.fill_rect(
+                        Rect::new(px(x), py(y + 20), px(x + fill), py(y + 37)),
+                        colors.fill,
+                    );
                 }
             }
-        } else {
+        }
+        if reading.is_some_and(|r| r.power_state == crate::device::PowerState::Charging) {
+            let bolt = [
+                (px(left + 124), py(y + 16)),
+                (px(left + 117), py(y + 29)),
+                (px(left + 123), py(y + 29)),
+                (px(left + 120), py(y + 40)),
+                (px(left + 130), py(y + 24)),
+                (px(left + 124), py(y + 24)),
+            ];
+            surface.fill_polygon(&bolt, colors.fill);
+        }
+        surface.blend_onto(dc, origin_x.round() as i32, origin_y.round() as i32);
+        if reading.is_none() {
             SetTextColor(dc, colors.secondary);
             panel_text(
                 dc,
@@ -3572,7 +4398,7 @@ unsafe fn draw_battery(
                 RECT {
                     left,
                     top: y + 14,
-                    right: left + 127,
+                    right: left + 107,
                     bottom: y + 42,
                 },
                 19,
@@ -3580,38 +4406,29 @@ unsafe fn draw_battery(
                 DT_CENTER | DT_VCENTER,
             );
         }
-        if reading.is_some_and(|r| r.power_state == crate::device::PowerState::Charging) {
-            let points = [
-                POINT {
-                    x: left + 144,
-                    y: y + 16,
-                },
-                POINT {
-                    x: left + 137,
-                    y: y + 29,
-                },
-                POINT {
-                    x: left + 143,
-                    y: y + 29,
-                },
-                POINT {
-                    x: left + 140,
-                    y: y + 40,
-                },
-                POINT {
-                    x: left + 150,
-                    y: y + 24,
-                },
-                POINT {
-                    x: left + 144,
-                    y: y + 24,
-                },
-            ];
-            SetDCBrushColor(dc, colors.fill);
-            SetDCPenColor(dc, colors.fill);
-            Polygon(dc, points.as_ptr(), 6);
-        }
     }
+}
+
+/// One-pixel separator. A GDI pen of one logical pixel scales to 1.5 device
+/// pixels under the panel mapping and renders as alternating 1px/2px steps;
+/// the rule is width-snapped instead.
+fn blend_rule(dc: HDC, dpi: i32, left: i32, right: i32, y: i32, color: u32) {
+    let scale = dpi as f32 / 96.0;
+    let width = right - left;
+    let thickness = scale.max(1.0);
+    if width <= 0 {
+        return;
+    }
+    let mut surface = Surface::new(
+        (width as f32 * scale).ceil() as usize,
+        thickness.ceil() as usize,
+    );
+    surface.fill_rect(Rect::new(0.0, 0.0, width as f32 * scale, thickness), color);
+    surface.blend_onto(
+        dc,
+        (left as f32 * scale).round() as i32,
+        (y as f32 * scale).round() as i32,
+    );
 }
 unsafe fn paint_panel(hwnd: HWND, view: &PanelView) {
     unsafe {
@@ -3629,19 +4446,84 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
         let colors = panel_colors();
         let paper = CreateSolidBrush(colors.paper);
         FillRect(dc, &client, paper);
+        // Frameless window: a hairline keeps the edge readable even where the
+        // system shadow is turned off in performance settings.
+        let edge = CreateSolidBrush(colors.empty);
+        FrameRect(dc, &client, edge);
+        DeleteObject(edge);
         use_panel_coordinates(dc, hwnd);
         let old_brush = SelectObject(dc, GetStockObject(DC_BRUSH));
         let old_pen = SelectObject(dc, GetStockObject(DC_PEN));
         let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        let scale = dpi as f32 / 96.0;
         let height = client.bottom * 96 / dpi;
+        if view.page == Page::Main {
+            // The summary bar keeps the same band as the other pages' titles, so
+            // switching pages does not jump the eye.
+            SetTextColor(dc, colors.text);
+            panel_text(
+                dc,
+                "外设名称",
+                RECT {
+                    left: 24,
+                    top: 10,
+                    right: 228,
+                    bottom: 50,
+                },
+                20,
+                700,
+                DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+            SetTextColor(dc, colors.secondary);
+            // Right-aligned against the history link, so a long device name and
+            // the summary can never claim the same pixels.
+            panel_text(
+                dc,
+                &main_summary(view),
+                RECT {
+                    left: 120,
+                    top: 14,
+                    right: 360,
+                    bottom: 46,
+                },
+                12,
+                400,
+                DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+            if !view.rows.is_empty() {
+                // Column captions use the empty space at the right of the header
+                // band instead of taking a line of their own above the list.
+                for (text, left, right) in [("托盘", 456, 494), ("提醒", 498, 536)] {
+                    panel_text(
+                        dc,
+                        text,
+                        RECT {
+                            left,
+                            top: 18,
+                            right,
+                            bottom: 42,
+                        },
+                        11,
+                        400,
+                        DT_CENTER | DT_VCENTER,
+                    );
+                }
+            }
+            // Sit the header rule exactly one pixel above the first row, the same
+            // way the row dividers behave, so every row band is 64px tall and the
+            // first row is not given extra breathing room the others lack.
+            blend_rule(dc, dpi, 24, 536, 67, colors.empty);
+        }
         if view.page != Page::Main {
             SetTextColor(dc, colors.text);
             panel_text(
                 dc,
                 if view.page == Page::Settings {
                     "设置"
-                } else {
+                } else if view.page == Page::Add {
                     "添加设备"
+                } else {
+                    "历史使用"
                 },
                 RECT {
                     left: 52,
@@ -3659,48 +4541,48 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
             IntersectClipRect(dc, 0, 64, 560, height - 24);
             let offset = view.scroll;
             for (id, left, top, right, bottom, error) in [
-                (THRESHOLD, 462, 167, 538, 201, view.threshold_error),
-                (REFRESH_INTERVAL, 434, 219, 538, 253, view.interval_error),
+                (THRESHOLD, 462, 119, 538, 153, view.threshold_error),
+                (REFRESH_INTERVAL, 434, 167, 538, 201, view.interval_error),
             ] {
                 let edit = GetDlgItem(hwnd, id as i32);
                 let focused = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == edit;
-                SetDCBrushColor(dc, colors.paper);
-                SetDCPenColor(
+                blend_round_rect(
                     dc,
-                    if (focused && focus_cues_visible(edit)) || error {
-                        colors.fill
-                    } else {
-                        colors.outline
-                    },
-                );
-                SelectObject(dc, GetStockObject(NULL_BRUSH));
-                RoundRect(dc, left, top - offset, right, bottom - offset, 5, 5);
-                SelectObject(dc, GetStockObject(DC_BRUSH));
-            }
-            if !view.rows.is_empty() {
-                SetDCPenColor(dc, colors.empty);
-                MoveToEx(dc, 24, 274 - offset, null_mut());
-                LineTo(dc, 536, 274 - offset);
-                SetTextColor(dc, colors.secondary);
-                for (text, left, right) in
-                    [("设备", 24, 300), ("托盘", 334, 380), ("提醒", 410, 458)]
-                {
-                    panel_text(
-                        dc,
-                        text,
-                        RECT {
-                            left,
-                            top: 284 - offset,
-                            right,
-                            bottom: 310 - offset,
+                    Rect::new(
+                        left as f32 * scale,
+                        (top - offset) as f32 * scale,
+                        right as f32 * scale,
+                        (bottom - offset) as f32 * scale,
+                    ),
+                    RADIUS_CONTROL * scale,
+                    None,
+                    Some((
+                        if (focused && focus_cues_visible()) || error {
+                            colors.fill
+                        } else {
+                            colors.outline
                         },
-                        13,
-                        400,
-                        DT_LEFT | DT_VCENTER,
-                    );
-                }
+                        scale,
+                    )),
+                );
             }
             RestoreDC(dc, clip);
+        }
+        if view.page == Page::History && view.rows.is_empty() {
+            SetTextColor(dc, colors.secondary);
+            panel_text(
+                dc,
+                "暂无已连接的设备",
+                RECT {
+                    left: 24,
+                    top: 82,
+                    right: 536,
+                    bottom: 138,
+                },
+                16,
+                400,
+                DT_CENTER | DT_VCENTER,
+            );
         }
         if view.page == Page::Add && view.rows.is_empty() {
             SetTextColor(dc, colors.secondary);
@@ -3725,9 +4607,9 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
                 "暂无已连接的设备",
                 RECT {
                     left: 24,
-                    top: 62,
+                    top: 78,
                     right: 536,
-                    bottom: 88,
+                    bottom: 104,
                 },
                 13,
                 400,
@@ -3735,14 +4617,14 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
             );
         }
         let top = match view.page {
-            Page::Main => 20,
+            Page::Main => 68,
             Page::Settings => 320,
-            Page::Add => 76,
+            Page::Add | Page::History => 76,
         };
         let footer = if view.page == Page::Main { 48 } else { 24 };
         for (index, state) in view.rows.iter().enumerate() {
-            let y = top + index as i32 * 64 - view.scroll;
-            if y < if view.page == Page::Main { 20 } else { 64 } || y + 56 > height - footer {
+            let y = top + index as i32 * ROW_HEIGHT - view.scroll;
+            if y < if view.page == Page::Main { 68 } else { 64 } || y + 56 > height - footer {
                 continue;
             }
             if let Some(icon) = view.symbols.get(index) {
@@ -3750,11 +4632,11 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
                 SetMapMode(dc, MM_TEXT);
                 DrawIconEx(
                     dc,
-                    24 * dpi / 96,
-                    (y + 13) * dpi / 96,
+                    SYMBOL_LEFT * dpi / 96,
+                    (y + SYMBOL_TOP) * dpi / 96,
                     icon.get(),
-                    28 * dpi / 96,
-                    28 * dpi / 96,
+                    SYMBOL_SIZE * dpi / 96,
+                    SYMBOL_SIZE * dpi / 96,
                     0,
                     null_mut(),
                     DI_NORMAL,
@@ -3762,16 +4644,45 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
                 RestoreDC(dc, saved);
             }
             if view.page == Page::Main {
-                draw_battery(dc, 302, y, state.reading.as_ref(), &colors);
+                draw_battery(dc, dpi, 248, y - 6, state.reading.as_ref(), &colors);
                 SetTextColor(dc, colors.secondary);
                 panel_text(
                     dc,
                     &row_detail(state),
                     RECT {
                         left: 64,
-                        top: y + 27,
-                        right: 300,
-                        bottom: y + 47,
+                        top: y + 36,
+                        right: 536,
+                        bottom: y + 56,
+                    },
+                    12,
+                    400,
+                    DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS,
+                );
+            }
+            if view.page == Page::History {
+                SetTextColor(dc, colors.secondary);
+                panel_text(
+                    dc,
+                    &history_span(state),
+                    RECT {
+                        left: 300,
+                        top: y + 8,
+                        right: 536,
+                        bottom: y + 34,
+                    },
+                    15,
+                    400,
+                    DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS,
+                );
+                panel_text(
+                    dc,
+                    &history_current_text(state),
+                    RECT {
+                        left: 64,
+                        top: y + 36,
+                        right: 536,
+                        bottom: y + 56,
                     },
                     12,
                     400,
@@ -3779,15 +4690,11 @@ unsafe fn draw_panel(dc: HDC, hwnd: HWND, view: &PanelView) {
                 );
             }
             if view.page != Page::Settings && index + 1 < view.rows.len() {
-                SetDCPenColor(dc, colors.empty);
-                MoveToEx(dc, 24, y + 63, null_mut());
-                LineTo(dc, 536, y + 63);
+                blend_rule(dc, dpi, 24, 536, y + ROW_HEIGHT - 1, colors.empty);
             }
         }
         if view.page == Page::Main && !view.rows.is_empty() {
-            SetDCPenColor(dc, colors.empty);
-            MoveToEx(dc, 24, height - 48, null_mut());
-            LineTo(dc, 536, height - 48);
+            blend_rule(dc, dpi, 24, 536, height - 48, colors.empty);
         }
         SelectObject(dc, old_brush);
         SelectObject(dc, old_pen);
@@ -3858,15 +4765,19 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             dwICC: ICC_STANDARD_CLASSES,
         };
         InitCommonControlsEx(&init);
-        for (name, proc) in [
+        for (name, proc, style) in [
             (
                 CLASS,
                 window_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                0u32,
             ),
-            (PANEL_CLASS, panel_proc),
+            // The drop shadow is what keeps a captionless panel from floating on
+            // a same-coloured desktop without an edge.
+            (PANEL_CLASS, panel_proc, CS_DROPSHADOW),
         ] {
             let class_name = wide(name);
             let class = WNDCLASSW {
+                style,
                 lpfnWndProc: Some(proc),
                 hInstance: instance,
                 lpszClassName: class_name.as_ptr(),
@@ -4041,9 +4952,12 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             panel_fonts: [null_mut(); 4],
             panel_icons: [null_mut(); 2],
             last_activity_refresh: Instant::now() - std::time::Duration::from_secs(10),
+            refresh_timer_seconds: Cell::new(0),
+            presence_timer_seconds: Cell::new(0),
+            awaiting_first_pass: false,
             picker_ids: Vec::new(),
             page: Page::Main,
-            page_scroll: [0; 3],
+            page_scroll: [0; 4],
             page_controls: Vec::new(),
             threshold_error: false,
             interval_error: false,
@@ -4071,7 +4985,7 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             std::mem::size_of::<RAWINPUTDEVICE>() as u32,
         );
         if SetTimer(hwnd, 2, 30_000, None) == 0
-            || SetTimer(hwnd, PRESENCE_TIMER, PRESENCE_MILLIS, None) == 0
+            || !app.apply_presence_timer()
             || !app.apply_refresh_timer()
         {
             app.quit();
@@ -4233,11 +5147,13 @@ mod tests {
                         ..Default::default()
                     },
                 );
-                assert!(!focus_cues_visible(parent));
-                assert_ne!(
-                    SendMessageW(parent, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize,
-                    0
-                );
+                assert!(!focus_cues_visible());
+                // The shell keeps its own flag instead of reading the window's UI
+                // state back: `WM_CHANGEUISTATE` is only a request, and a plain
+                // window cannot rely on the system applying it. On this machine it
+                // is dropped, which is exactly why a mouse click used to leave a
+                // 250px focus ring around the switch it landed on.
+                assert!(!focus_cues_visible());
                 input_focus_cues(
                     parent,
                     &MSG {
@@ -4246,7 +5162,7 @@ mod tests {
                         ..Default::default()
                     },
                 );
-                assert!(!focus_cues_visible(control));
+                assert!(!focus_cues_visible());
                 for key in [9, 13, 32] {
                     input_focus_cues(
                         parent,
@@ -4257,7 +5173,7 @@ mod tests {
                             ..Default::default()
                         },
                     );
-                    assert!(focus_cues_visible(control));
+                    assert!(focus_cues_visible());
                     set_focus_cues(parent, false);
                 }
             }
@@ -4270,7 +5186,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            assert!(!focus_cues_visible(parent));
+            assert!(!focus_cues_visible());
             assert_eq!(
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus(),
                 focused,
@@ -4721,9 +5637,12 @@ mod tests {
                 panel_fonts: [null_mut(); 4],
                 panel_icons: [null_mut(); 2],
                 last_activity_refresh: Instant::now(),
+                refresh_timer_seconds: Cell::new(0),
+                presence_timer_seconds: Cell::new(0),
+                awaiting_first_pass: false,
                 picker_ids: Vec::new(),
                 page: Page::Main,
-                page_scroll: [0; 3],
+                page_scroll: [0; 4],
                 page_controls: Vec::new(),
                 threshold_error: false,
                 interval_error: false,
@@ -5338,7 +6257,10 @@ mod tests {
                 }
                 child = GetWindow(child, GW_HWNDNEXT);
             }
-            assert_eq!(GetPixel(dc, 0, 0), panel_colors().paper);
+            // A frameless panel draws a hairline frame, so the very edge is the
+            // border colour and the paper starts one pixel in.
+            assert_eq!(GetPixel(dc, 0, 0), panel_colors().empty);
+            assert_eq!(GetPixel(dc, 1, 1), panel_colors().paper);
             let len = (client.right * client.bottom * 4) as usize;
             let mut bytes = Vec::new();
             bytes.extend(b"BM");
@@ -5401,9 +6323,12 @@ mod tests {
                 panel_fonts: [null_mut(); 4],
                 panel_icons: [null_mut(); 2],
                 last_activity_refresh: Instant::now(),
+                refresh_timer_seconds: Cell::new(0),
+                presence_timer_seconds: Cell::new(0),
+                awaiting_first_pass: false,
                 picker_ids: Vec::new(),
                 page: Page::Main,
-                page_scroll: [0; 3],
+                page_scroll: [0; 4],
                 page_controls: Vec::new(),
                 threshold_error: false,
                 interval_error: false,
@@ -5440,7 +6365,10 @@ mod tests {
                     connection_known: true,
                     silent_since: None,
                     usage_since: None,
+                    usage_from: None,
                     last_seen: None,
+                    usage_cycles: Vec::new(),
+                    full_since: None,
                 });
             }
             app.show_panel();
@@ -5480,23 +6408,32 @@ mod tests {
             assert!(edit_rect.bottom <= suffix_rect.bottom);
             hidden_native_bitmap(window, "settings-fixture");
             assert_eq!(app.panel, window);
+            // The settings page is a fixed form now: no device rows at all, and
+            // the master switch is the only device-related control left.
+            assert!(app.rows.is_empty());
+            let master = GetDlgItem(window, ALL_SWITCHES as i32);
+            assert!(!master.is_null());
+            assert_eq!(SendMessageW(master, BM_GETCHECK, 0, 0), 1);
+            assert_eq!(window_text(master), "所有设备的托盘与提醒");
+
+            // Renaming, tooltips and focus anchors are exercised on the main
+            // page, which is the one that lists devices.
+            app.switch_page(Page::Main);
             assert_eq!(app.rows.len(), 1);
-            assert_eq!(SendMessageW(app.rows[0].percent, BM_GETCHECK, 0, 0), 1);
-            assert!(window_text(app.rows[0].percent).contains("mouse，显示托盘"));
-            let anchor = app.anchor_for(app.rows[0].refresh).unwrap();
+            let anchor = app.anchor_for(app.rows[0].tray).unwrap();
             let previous_model = app.rows[0].model;
             app.manager.devices[0].descriptor.name = "Renamed mouse".into();
             app.manager.devices[0].descriptor.kind = DeviceKind::Headset;
             app.rebuild_rows();
             assert_ne!(app.rows[0].model, previous_model);
             assert_eq!(window_text(app.rows[0].model), "Renamed mouse");
-            assert!(window_text(app.rows[0].refresh).contains("Renamed mouse，低电提醒"));
+            assert!(window_text(app.rows[0].tray).contains("Renamed mouse，显示托盘"));
             assert_eq!(app.rows[0].presentation.2, DeviceKind::Headset);
             assert_eq!(
                 app.rows[0]._tooltip_text,
                 wide("Renamed mouse · 2.4G 接收器")
             );
-            assert_eq!(app.resolve_anchor(&anchor).unwrap().0, app.rows[0].refresh);
+            assert_eq!(app.resolve_anchor(&anchor).unwrap().0, app.rows[0].tray);
             assert!(app.anchor_for(null_mut()).is_none());
             let foreign = CreateWindowExW(
                 0,
@@ -5519,8 +6456,8 @@ mod tests {
             duplicate.selected = false;
             app.manager.devices.push(duplicate);
             app.rebuild_rows();
-            assert!(window_text(app.rows[0].model).contains('·'));
-            assert!(window_text(app.rows[0].refresh).contains('·'));
+            // The main page never decorates a name; only the mixed lists do.
+            assert!(!window_text(app.rows[0].model).contains('·'));
             app.manager.devices.pop();
             app.rebuild_rows();
             let dc = CreateCompatibleDC(null_mut());
@@ -5548,19 +6485,26 @@ mod tests {
                 outline: 0xffffff,
                 high_contrast: true,
             };
-            draw_control_colors(app.rows[0].percent, true, dc, &high_contrast);
+            // The per-device switches live on the main page now, so the
+            // high-contrast render and the reminder gating are checked there.
+            app.switch_page(Page::Main);
+            draw_control_colors(app.rows[0].tray, true, dc, &high_contrast);
             let mut bb: RECT = std::mem::zeroed();
-            GetClientRect(app.rows[0].percent, &mut bb);
-            assert_eq!(GetPixel(dc, 4, 18), high_contrast.fill);
-            assert_eq!(window_text(app.rows[0].percent), "Renamed mouse，显示托盘");
+            GetClientRect(app.rows[0].tray, &mut bb);
+            assert_eq!(
+                GetPixel(dc, bb.right / 4, bb.bottom / 2),
+                high_contrast.fill
+            );
+            assert!(window_text(app.rows[0].tray).contains("Renamed mouse，显示托盘"));
             SelectObject(dc, old);
             DeleteObject(bitmap);
             DeleteDC(dc);
             app.page_command(ALERTS);
             assert!(!app.manager.notifications_enabled);
-            assert_eq!(IsWindowEnabled(app.rows[0].refresh), 0);
-            assert_ne!(IsWindowEnabled(app.rows[0].percent), 0);
+            assert_eq!(IsWindowEnabled(app.rows[0].notify), 0);
+            assert_ne!(IsWindowEnabled(app.rows[0].tray), 0);
             app.page_command(ALERTS);
+            app.switch_page(Page::Settings);
             let edit = GetDlgItem(window, THRESHOLD as i32);
             SetWindowTextW(edit, wide("101").as_ptr());
             app.submit_threshold(true);
@@ -5581,17 +6525,17 @@ mod tests {
             for row in &app.rows {
                 assert_eq!(row.extra.len(), 2);
                 assert_eq!(window_text(row.extra[0]), "复制信息");
-                assert_eq!(window_text(row.extra[1]), "导出文件");
-                let bounds = [row.extra[0], row.extra[1], row.refresh].map(|h| {
+                assert!(window_text(row.extra[1]).contains("移除监控"));
+                let bounds = [row.extra[0], row.refresh, row.extra[1]].map(|h| {
                     let mut r = RECT::default();
                     GetWindowRect(h, &mut r);
                     r
                 });
-                assert!(bounds[0].right <= bounds[1].left && bounds[1].right <= bounds[2].left);
+                assert!(bounds.windows(2).all(|pair| pair[0].right <= pair[1].left));
                 assert!(bounds.iter().all(|r| r.bottom - r.top >= 32));
             }
             let i = app.rows.iter().position(|r| r.id == "keyboard").unwrap();
-            app.page_command(ADD_BASE + i as u32 * 3);
+            app.page_command(ADD_BASE + i as u32 * ADD_STRIDE);
             assert_eq!(app.rows.len(), 3);
             assert_eq!(window_text(app.rows[i].refresh), "已添加");
             assert_eq!(IsWindowEnabled(app.rows[i].refresh), 0);
@@ -5610,7 +6554,9 @@ mod tests {
             }
             app.rebuild_rows();
             let last = app.rows.len() - 1;
-            let target = app.rows[last].refresh;
+            // The main page's per-row control is the tray switch; the add page
+            // is the one that owns the action buttons.
+            let target = app.rows[last].tray;
             app.focus_target(target, Some(last));
             assert!(app.scroll > 0);
             assert_eq!(
@@ -5621,9 +6567,11 @@ mod tests {
             app.switch_page(Page::Settings);
             app.switch_page(Page::Main);
             assert_eq!(app.scroll, scroll);
+            // The header link is created after the two footer buttons, so it
+            // closes the page's tab order.
             assert_eq!(
                 app.focus_targets().last().unwrap().0,
-                GetDlgItem(window, SETTINGS as i32)
+                GetDlgItem(window, HISTORY as i32)
             );
             app.close_panel();
             assert_eq!(IsWindow(window), 0);
@@ -5631,6 +6579,367 @@ mod tests {
             UnregisterClassW(name.as_ptr(), instance);
             let _ = std::fs::remove_file(manager::state_path());
         }
+    }
+    fn usage_state(name: &str, cycles: &[(u64, u64)]) -> DeviceState {
+        DeviceState {
+            descriptor: crate::device::DeviceDescriptor {
+                id: name.to_lowercase(),
+                physical_id: format!("physical-{name}"),
+                endpoint: None,
+                recoverable: true,
+                name: name.into(),
+                kind: DeviceKind::Mouse,
+                supported: true,
+                provider: "fixture".into(),
+                connection: crate::device::Connection::Receiver,
+            },
+            selected: true,
+            removed: false,
+            show_tray: true,
+            notify: true,
+            alert: crate::notifications::AlertRecord::default(),
+            reading: Some(
+                Reading::from_percent(name.into(), 98, crate::device::PowerState::Discharging)
+                    .unwrap(),
+            ),
+            last_success: Some(now()),
+            error: None,
+            connected: true,
+            connection_known: true,
+            silent_since: None,
+            usage_since: Some(now().saturating_sub(3_600)),
+            usage_from: Some(98),
+            last_seen: Some((98, crate::device::PowerState::Discharging)),
+            usage_cycles: cycles
+                .iter()
+                .map(|(ended, seconds)| manager::UsageCycle {
+                    ended: *ended,
+                    seconds: *seconds,
+                    ended_percent: Some(9),
+                })
+                .collect(),
+            full_since: None,
+        }
+    }
+    #[test]
+    fn history_page_lists_connected_devices_longest_first_without_controls() {
+        unsafe {
+            let mut manager = Manager::default();
+            manager
+                .devices
+                .push(usage_state("Short run", &[(now() - 86_400 * 3, 3_600)]));
+            // Two runs: the page shows the longest one, not the latest.
+            manager.devices.push(usage_state(
+                "Long run",
+                &[(now() - 86_400 * 5, 3 * 86_400), (now() - 86_400, 7_200)],
+            ));
+            // No completed run yet: still listed, with the run in progress.
+            manager.devices.push(usage_state("No run", &[]));
+            let (mut app, _) = headless_app(manager);
+            let window = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                560,
+                600,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!window.is_null());
+            attach_bridge(window, &app.bridge);
+            app.panel = window;
+            app.page_command(HISTORY);
+            assert_eq!(app.page, Page::History);
+            assert_eq!(app.rows.len(), 3);
+            assert_eq!(app.rows[0].id, "long run");
+            assert_eq!(app.rows[1].id, "short run");
+            // A device without a completed run keeps a row of its own.
+            assert_eq!(app.rows[2].id, "no run");
+            // One line per device: the name is the only control, the two
+            // durations are painted by the panel.
+            assert!(app.rows[0].percent.is_null());
+            assert!(app.rows[0].tray.is_null());
+            assert!(app.rows[0].notify.is_null());
+            assert!(app.rows[0].refresh.is_null());
+            assert!(app.rows[0].extra.is_empty());
+            hidden_native_bitmap(window, "history-fixture");
+            app.page_command(BACK);
+            assert_eq!(app.page, Page::Main);
+            hidden_native_bitmap(window, "main-title-fixture");
+            release_window_bridge(window);
+            assert_ne!(DestroyWindow(window), 0);
+        }
+    }
+    #[test]
+    fn main_summary_counts_devices_and_names_the_lowest() {
+        let mut view = PanelView::default();
+        let state = usage_state("MCHOSE A5 V3 Ultra", &[]);
+        view.rows.push(state.clone());
+        assert_eq!(main_summary(&view), "1 台设备 · 最低 98% · 刚刚更新");
+        let mut lower = state;
+        lower.reading = Some(
+            Reading::from_percent("Other".into(), 42, crate::device::PowerState::Discharging)
+                .unwrap(),
+        );
+        view.rows.push(lower);
+        assert_eq!(main_summary(&view), "2 台设备 · 最低 42% · 刚刚更新");
+        view.rows.clear();
+        assert_eq!(main_summary(&view), "暂无设备");
+    }
+    #[test]
+    fn history_current_text_counts_an_unrecorded_start_from_a_full_charge() {
+        let state = usage_state("MCHOSE A5 V3 Ultra", &[]);
+        let text = history_current_text(&state);
+        assert!(text.starts_with("当前 "), "{text}");
+        assert!(text.contains("→ 现在 · 98% → 98%"), "{text}");
+        assert!(text.ends_with("已用1小时"), "{text}");
+        // A run that began before the starting percentage was stored counts
+        // from 100%, the value a full charge starts from.
+        let mut legacy = state.clone();
+        legacy.usage_from = None;
+        assert!(
+            history_current_text(&legacy).contains("100% → 98%"),
+            "{}",
+            history_current_text(&legacy)
+        );
+        let mut idle = state.clone();
+        idle.usage_since = None;
+        assert_eq!(history_current_text(&idle), "当前 · 尚未开始记录");
+        let mut charging = state;
+        charging.reading = Some(
+            Reading::from_percent("X".into(), 98, crate::device::PowerState::Charging).unwrap(),
+        );
+        assert_eq!(history_current_text(&charging), "当前 · 充电中");
+    }
+    #[test]
+    fn panel_height_follows_the_connected_rows_and_keeps_its_bottom() {
+        unsafe {
+            let mut manager = Manager::default();
+            for index in 0..9 {
+                let mut state = usage_state(&format!("Device {index}"), &[]);
+                // Only the first is connected; the rest look like rows loaded
+                // from disk that no probe has confirmed yet.
+                state.connected = index == 0;
+                state.connection_known = index == 0;
+                manager.devices.push(state);
+            }
+            let (mut app, _) = headless_app(manager);
+            let name = wide(PANEL_CLASS);
+            let instance = GetModuleHandleW(null());
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(panel_proc),
+                hInstance: instance,
+                lpszClassName: name.as_ptr(),
+                ..std::mem::zeroed()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let window = CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                name.as_ptr(),
+                null(),
+                WS_POPUP | WS_CLIPCHILDREN | WS_VSCROLL,
+                0,
+                0,
+                560,
+                180,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            );
+            assert!(!window.is_null());
+            attach_bridge(window, &app.bridge);
+            app.panel = window;
+            app.create_page_controls();
+            app.rebuild_rows();
+            app.layout_panel();
+            let mut tall: RECT = std::mem::zeroed();
+            GetWindowRect(window, &mut tall);
+            assert_eq!(app.rows.len(), 9, "unconfirmed rows are listed first");
+
+            // Every row but the first is now confirmed disconnected.
+            for state in app.manager.devices.iter_mut().skip(1) {
+                state.connected = false;
+                state.connection_known = true;
+            }
+            app.rebuild_rows();
+            app.layout_panel();
+            let mut short: RECT = std::mem::zeroed();
+            GetWindowRect(window, &mut short);
+            assert_eq!(app.rows.len(), 1);
+            assert!(
+                short.bottom - short.top < tall.bottom - tall.top,
+                "window did not shrink: tall {} short {}",
+                tall.bottom - tall.top,
+                short.bottom - short.top
+            );
+            // Bottom-anchored: the footer must not move, the top comes down.
+            assert_eq!(short.bottom, tall.bottom, "bottom edge moved");
+            assert!(short.top > tall.top, "top edge did not move up");
+
+            release_window_bridge(window);
+            let _ = DestroyWindow(window);
+            UnregisterClassW(name.as_ptr(), instance);
+        }
+    }
+    #[test]
+    fn window_pin_switch_is_on_by_default_and_owns_the_second_column() {
+        unsafe {
+            let (mut app, _) = headless_app(Manager::default());
+            let window = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                560,
+                600,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!window.is_null());
+            attach_bridge(window, &app.bridge);
+            app.panel = window;
+            app.page = Page::Settings;
+            app.create_page_controls();
+            app.rebuild_rows();
+            let pin = GetDlgItem(window, WINDOW_PIN as i32);
+            let all = GetDlgItem(window, ALL_SWITCHES as i32);
+            assert!(!pin.is_null() && !all.is_null());
+            assert_eq!(SendMessageW(pin, BM_GETCHECK, 0, 0), 1, "pinned by default");
+            // The last settings row is two columns, like the rows above it.
+            let mut left: RECT = std::mem::zeroed();
+            let mut right: RECT = std::mem::zeroed();
+            GetWindowRect(all, &mut left);
+            GetWindowRect(pin, &mut right);
+            assert!(left.right <= right.left, "columns overlap");
+            assert_eq!(left.top, right.top, "same row band");
+            // Both directions keep the button and the model in step.
+            app.page_command(WINDOW_PIN);
+            assert!(!app.manager.window_pinned);
+            assert_eq!(SendMessageW(pin, BM_GETCHECK, 0, 0), 0);
+            app.page_command(WINDOW_PIN);
+            assert!(app.manager.window_pinned);
+            assert_eq!(SendMessageW(pin, BM_GETCHECK, 0, 0), 1);
+            release_window_bridge(window);
+            assert_ne!(DestroyWindow(window), 0);
+            let _ = std::fs::remove_file(manager::state_path());
+        }
+    }
+    #[test]
+    fn panel_sits_in_the_bottom_right_corner_and_remembers_a_dragged_spot() {
+        unsafe {
+            let (mut app, _) = headless_app(Manager::default());
+            let window = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                40,
+                40,
+                560,
+                300,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!window.is_null());
+            attach_bridge(window, &app.bridge);
+            app.panel = window;
+
+            // Pinned by default: bottom-right corner of the work area, ignoring
+            // any remembered spot.
+            app.manager.panel_anchor = Some((120, 440));
+            app.apply_panel_position();
+            let mut rect: RECT = std::mem::zeroed();
+            GetWindowRect(window, &mut rect);
+            let work = work_area_at(POINT {
+                x: (rect.right - 1).max(0),
+                y: (rect.bottom - 1).max(0),
+            });
+            assert!(
+                (rect.right - work.right).abs() <= 2,
+                "right {} vs work right {}",
+                rect.right,
+                work.right
+            );
+            assert!(
+                (rect.bottom - work.bottom).abs() <= 2,
+                "bottom {} vs work bottom {}",
+                rect.bottom,
+                work.bottom
+            );
+
+            // Unpinned: a moved window is remembered on close, and restored.
+            app.manager.window_pinned = false;
+            assert_ne!(
+                SetWindowPos(
+                    window,
+                    null_mut(),
+                    120,
+                    140,
+                    560,
+                    300,
+                    SWP_NOZORDER | SWP_NOACTIVATE
+                ),
+                0
+            );
+            app.remember_panel_position();
+            assert_eq!(app.manager.panel_anchor, Some((120, 440)));
+            assert_ne!(
+                SetWindowPos(
+                    window,
+                    null_mut(),
+                    300,
+                    220,
+                    560,
+                    300,
+                    SWP_NOZORDER | SWP_NOACTIVATE
+                ),
+                0
+            );
+            app.apply_panel_position();
+            GetWindowRect(window, &mut rect);
+            assert_eq!((rect.left, rect.top), (120, 140));
+
+            // A remembered spot no monitor covers (screen unplugged) is dropped
+            // rather than leaving the window unreachable.
+            app.manager.panel_anchor = Some((-30_000, -30_000));
+            app.apply_panel_position();
+            GetWindowRect(window, &mut rect);
+            assert!(anchor_on_some_monitor(
+                rect.left,
+                rect.bottom,
+                rect.right - rect.left
+            ));
+
+            release_window_bridge(window);
+            assert_ne!(DestroyWindow(window), 0);
+            let _ = std::fs::remove_file(manager::state_path());
+        }
+    }
+    #[test]
+    fn history_span_reports_the_longest_and_shortest_completed_runs() {
+        let two = usage_state("two", &[(now() - 600, 3_600), (now() - 100, 7_200)]);
+        assert_eq!(history_span(&two), "最长 2小时 · 最短 1小时");
+        // A single record states its length once instead of repeating it.
+        let one = usage_state("one", &[(now() - 600, 3_600)]);
+        assert_eq!(history_span(&one), "最长 1小时");
+        // No completed run: say so, never borrow the run in progress.
+        let none = usage_state("none", &[]);
+        assert_eq!(history_span(&none), "尚无完整满电记录");
+        // The shortest wins over the order the records arrived in.
+        let unordered = usage_state("unordered", &[(now() - 100, 9_000), (now() - 200, 600)]);
+        assert_eq!(history_span(&unordered), "最长 2小时30分 · 最短 10分钟");
     }
     #[test]
     fn row_detail_shows_link_state_and_reading_age() {
@@ -5658,23 +6967,23 @@ mod tests {
             connection_known: false,
             silent_since: None,
             usage_since: None,
+            usage_from: None,
             last_seen: None,
+            usage_cycles: Vec::new(),
+            full_since: None,
         };
         // Before the first discovery the link is genuinely unknown, never "down".
         assert_eq!(row_detail(&state), "2.4G · 连接状态未知");
         state.connection_known = true;
         assert_eq!(row_detail(&state), "2.4G · 未连接");
         state.connected = true;
-        assert_eq!(row_detail(&state), "2.4G · 已使用— · 尚未读取");
+        // The reading age moved to the header summary; the row no longer
+        // repeats it, whatever the age is.
+        assert_eq!(row_detail(&state), "2.4G · 已使用—");
         state.usage_since = Some(now().saturating_sub(3 * 86_400 + 5 * 3_600));
-        for (age, usage, expected) in [
-            (0u64, "3天5小时", "2.4G · 已使用3天5小时 · 刚刚更新"),
-            (61, "3天5小时", "2.4G · 已使用3天5小时 · 1 分钟前"),
-            (7_200, "3天5小时", "2.4G · 已使用3天5小时 · 2 小时前"),
-            (180_000, "3天5小时", "2.4G · 已使用3天5小时 · 2 天前"),
-        ] {
+        for age in [0u64, 61, 7_200, 180_000] {
             state.last_success = Some(now().saturating_sub(age));
-            assert_eq!(row_detail(&state), expected, "usage {usage} age {age}");
+            assert_eq!(row_detail(&state), "2.4G · 已使用3天5小时", "age {age}");
         }
         state.usage_since = Some(now().saturating_sub(42));
         assert!(row_detail(&state).contains("已使用不到1分钟"));
@@ -5740,7 +7049,7 @@ mod tests {
             app.create_page_controls();
             app.rebuild_rows();
             let interval = GetDlgItem(window, REFRESH_INTERVAL as i32);
-            assert_eq!(window_text(interval), "2");
+            assert_eq!(window_text(interval), "5");
             assert_ne!(IsWindowEnabled(interval), 0);
             assert_eq!(
                 SendMessageW(GetDlgItem(window, AUTO_REFRESH as i32), BM_GETCHECK, 0, 0),
@@ -5763,10 +7072,10 @@ mod tests {
             app.page_command(CONNECTIONS);
             assert!(app.manager.connection_notifications);
             for (typed, seconds, error) in [
-                ("0", 120, true),
-                ("61", 120, true),
-                ("bad", 120, true),
-                ("", 120, true),
+                ("0", 300, true),
+                ("61", 300, true),
+                ("bad", 300, true),
+                ("", 300, true),
                 ("1", 60, false),
                 ("5", 300, false),
             ] {
@@ -5776,8 +7085,9 @@ mod tests {
                 assert_eq!(app.interval_error, error, "typed {typed}");
             }
             // A confirmed value clears the error and resets the timer.
+            SetWindowTextW(interval, wide("7").as_ptr());
             app.submit_refresh_interval(false);
-            assert_eq!(app.manager.refresh_seconds, 300);
+            assert_eq!(app.manager.refresh_seconds, 420);
             assert!(!app.interval_error);
             hidden_native_bitmap(window, "settings-refresh-fixture");
             // The row shows the link type and reading age on the main page.
@@ -5787,6 +7097,88 @@ mod tests {
             release_window_bridge(window);
             assert_ne!(DestroyWindow(window), 0);
             let _ = std::fs::remove_file(manager::state_path());
+        }
+    }
+    #[test]
+    fn idle_follows_raw_input_recency_and_drives_both_cadences() {
+        let (app, _) = headless_app(Manager::default());
+        app.bridge.activity_seen.set(Instant::now());
+        assert!(!app.idle());
+        assert_eq!(
+            app.manager.presence_cadence(app.idle()),
+            manager::PRESENCE_ACTIVE_SECONDS
+        );
+        // One second past the idle threshold: both timers take the slow cadence.
+        app.bridge
+            .activity_seen
+            .set(Instant::now() - std::time::Duration::from_secs(manager::IDLE_AFTER_SECONDS + 1));
+        assert!(app.idle());
+        assert_eq!(
+            app.manager.presence_cadence(app.idle()),
+            manager::PRESENCE_IDLE_SECONDS
+        );
+        assert_eq!(
+            app.manager.refresh_cadence(app.idle()),
+            manager::IDLE_REFRESH_SECONDS
+        );
+        // Input arriving again restores the active cadence immediately.
+        app.bridge.activity_seen.set(Instant::now());
+        assert_eq!(
+            app.manager.refresh_cadence(app.idle()),
+            manager::DEFAULT_REFRESH_SECONDS
+        );
+    }
+    #[test]
+    fn settings_hint_keeps_the_interval_row_inside_the_panel() {
+        unsafe {
+            let (mut app, _) = headless_app(Manager::default());
+            let window = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                560,
+                600,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!window.is_null());
+            attach_bridge(window, &app.bridge);
+            app.panel = window;
+            app.page = Page::Settings;
+            app.create_page_controls();
+            app.rebuild_rows();
+            app.layout_panel();
+            let rect = |id: u32| {
+                let mut value: RECT = std::mem::zeroed();
+                let control = GetDlgItem(window, id as i32);
+                assert!(!control.is_null(), "control {id}");
+                assert_ne!(GetWindowRect(control, &mut value), 0, "control {id}");
+                value
+            };
+            let interval = rect(REFRESH_INTERVAL);
+            let hint = rect(INTERVAL_HINT);
+            let all = rect(ALL_SWITCHES);
+            // The line explains the field above it and must not touch it…
+            assert!(hint.top >= interval.bottom, "hint overlaps the field row");
+            // …nor crowd the master switch below it.
+            assert!(hint.bottom <= all.top, "hint overlaps the master switch");
+            // Everything the layout places below the footer bound is hidden, so
+            // a visible style here is the same statement as "inside the page".
+            for id in [INTERVAL_HINT, ALL_SWITCHES, REFRESH_INTERVAL] {
+                assert_ne!(
+                    GetWindowLongPtrW(GetDlgItem(window, id as i32), GWL_STYLE)
+                        & WS_VISIBLE as isize,
+                    0,
+                    "control {id} was laid out outside the page"
+                );
+            }
+            release_window_bridge(window);
+            assert_ne!(DestroyWindow(window), 0);
         }
     }
     #[test]
@@ -5848,9 +7240,12 @@ mod tests {
             panel_fonts: [null_mut(); 4],
             panel_icons: [null_mut(); 2],
             last_activity_refresh: Instant::now(),
+            refresh_timer_seconds: Cell::new(0),
+            presence_timer_seconds: Cell::new(0),
+            awaiting_first_pass: false,
             picker_ids: Vec::new(),
             page: Page::Main,
-            page_scroll: [0; 3],
+            page_scroll: [0; 4],
             page_controls: Vec::new(),
             threshold_error: false,
             interval_error: false,
@@ -6073,8 +7468,8 @@ mod tests {
                     crate::device::PowerState::Discharging,
                 )
                 .unwrap();
-                draw_battery(dc, 210, 0, Some(&reading), &colors);
-                let x = 214 + cell * 12;
+                draw_battery(dc, 96, 210, 0, Some(&reading), &colors);
+                let x = 214 + cell * 10;
                 if width > 0 {
                     assert_eq!(GetPixel(dc, x + width - 1, 25), colors.fill);
                 }

@@ -98,7 +98,17 @@ fn matching(collections: &[Collection]) -> String {
             )
         ),
     ];
-    for adapter in [&super::compx::ADAPTER, &super::razer::ADAPTER] {
+    // One entry per static-profile `vendor_hid::Adapter`; adding a profile
+    // elsewhere must add it here too, otherwise a device whose profile exists
+    // but whose collection was not recognized looks identical to one with no
+    // profile at all. HID++/darmoshark/BAS/HFP/DELUX use their own predicates
+    // and are appended above/below.
+    for adapter in [
+        &super::compx::ADAPTER,
+        &super::mchose::ADAPTER,
+        &super::mchose_headset::ADAPTER,
+        &super::razer::ADAPTER,
+    ] {
         let known: Vec<_> = collections
             .iter()
             .filter_map(|c| (adapter.identify)(c).map(|p| (c, p)))
@@ -353,6 +363,33 @@ mod tests {
         let matched = matching(&[c]);
         assert!(matched.contains("Profile and control collection match"));
         assert!(matching(&[]).contains("VID/PID has no built-in profile"));
+    }
+    #[test]
+    fn matching_keeps_the_two_mchose_channels_apart() {
+        let collection = |vid: u16, pid: u16, page: u16, usage: u16| {
+            let mut c = Collection::default();
+            for (key, value) in [
+                ("vid", vid),
+                ("pid", pid),
+                ("usage_page", page),
+                ("usage", usage),
+                ("input_report_bytes", 64),
+                ("output_report_bytes", 64),
+            ] {
+                c.fields.insert(key, Field::number(value, "fixture"));
+            }
+            c
+        };
+        // V9 Pro 2 receiver: FF07:0222 answers the headset parameter read. The
+        // mouse protocol needs FF01:0001 on another model, so it must stay
+        // unmatched instead of silently reusing this collection.
+        let headset = matching(&[collection(0x3837, 0x6011, 0xff07, 0x0222)]);
+        assert!(headset.contains("\"adapter\":\"mchose-hs\",\"profile_matched\":true"));
+        assert!(headset.contains("\"adapter\":\"mchose\",\"profile_matched\":false"));
+        // A5 V3 Ultra receiver: the mouse channel matches, no headset profile.
+        let mouse = matching(&[collection(0x3837, 0x1014, 0xff01, 0x0001)]);
+        assert!(mouse.contains("\"adapter\":\"mchose\",\"profile_matched\":true"));
+        assert!(mouse.contains("\"adapter\":\"mchose-hs\",\"profile_matched\":false"));
     }
     #[test]
     fn cancelled_collection_does_not_enumerate_or_touch_hardware() {

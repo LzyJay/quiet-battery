@@ -1,5 +1,6 @@
 //! Native owned device symbols and percentage tray meters, using approved v10 silhouettes.
 use crate::device::DeviceKind;
+use crate::shapes::{mix, premultiplied};
 use std::{ffi::c_void, ptr::null_mut};
 use windows_sys::Win32::{
     Foundation::ERROR_SUCCESS,
@@ -126,25 +127,99 @@ impl SymbolIcon {
 }
 fn symbol_pixels(n: usize, kind: DeviceKind, appearance: Appearance) -> Vec<u32> {
     let (rim, fill, _) = appearance.colors();
-    let slot = SYMBOL_SIZES
+    sample_layer(&SYMBOL_LAYERS, &SYMBOL_SIZES, kind, n)
+        .into_iter()
+        .map(|(alpha, inner)| premultiplied(mix(rim, fill, inner), alpha))
+        .collect()
+}
+
+/// Interleaved `(alpha, inner)` silhouette for one device kind at `n` pixels.
+/// Approved sizes are copied untouched, so the frozen regression rasters stay
+/// bit-identical. Other sizes shrink through an area box filter and grow
+/// through bilinear interpolation: the old nearest-neighbour sampling dropped
+/// or duplicated whole rows and left 175% / 225% / 250% displays jagged.
+fn sample_layer(layers: &[&[u8]], sizes: &[usize], kind: DeviceKind, n: usize) -> Vec<(u8, u8)> {
+    // Prefer the smallest approved raster at or above the target: shrinking
+    // preserves the drawn edge better than stretching a smaller silhouette.
+    let slot = sizes
         .iter()
-        .enumerate()
-        .min_by_key(|(_, size)| size.abs_diff(n))
-        .map(|(slot, _)| slot)
-        .unwrap();
-    let source = SYMBOL_SIZES[slot];
-    let mut image = vec![0; n * n];
+        .position(|size| *size >= n)
+        .unwrap_or(sizes.len() - 1);
+    let source = sizes[slot];
+    let offset = kind_index(kind) * source * source * 2;
+    let data = &layers[slot][offset..offset + source * source * 2];
+    if n == source {
+        return (0..n * n)
+            .map(|index| (data[index * 2], data[index * 2 + 1]))
+            .collect();
+    }
+    let mut output = vec![(0u8, 0u8); n * n];
+    if n < source {
+        // Summed-area tables keep every output pixel at four lookups.
+        let stride = source + 1;
+        let mut alpha_sum = vec![0u32; stride * stride];
+        let mut inner_sum = vec![0u32; stride * stride];
+        for y in 0..source {
+            let (mut alpha_row, mut inner_row) = (0u32, 0u32);
+            for x in 0..source {
+                let at = (y * source + x) * 2;
+                alpha_row += u32::from(data[at]);
+                inner_row += u32::from(data[at + 1]);
+                alpha_sum[(y + 1) * stride + x + 1] = alpha_sum[y * stride + x + 1] + alpha_row;
+                inner_sum[(y + 1) * stride + x + 1] = inner_sum[y * stride + x + 1] + inner_row;
+            }
+        }
+        let area = |sums: &[u32], x0: usize, y0: usize, x1: usize, y1: usize| {
+            sums[y1 * stride + x1] + sums[y0 * stride + x0]
+                - sums[y0 * stride + x1]
+                - sums[y1 * stride + x0]
+        };
+        for y in 0..n {
+            let y0 = y * source / n;
+            let y1 = ((y + 1) * source / n).max(y0 + 1).min(source);
+            for x in 0..n {
+                let x0 = x * source / n;
+                let x1 = ((x + 1) * source / n).max(x0 + 1).min(source);
+                let count = ((x1 - x0) * (y1 - y0)) as u32;
+                output[y * n + x] = (
+                    (area(&alpha_sum, x0, y0, x1, y1) / count) as u8,
+                    (area(&inner_sum, x0, y0, x1, y1) / count) as u8,
+                );
+            }
+        }
+        return output;
+    }
+    // Growth: bilinear over transparent padding, so the silhouette fades in at
+    // its rim instead of turning into 2x2 blocks.
+    let step = source as f32 / n as f32;
+    let texel = |x: i32, y: i32, channel: usize| -> f32 {
+        if x < 0 || y < 0 || x >= source as i32 || y >= source as i32 {
+            0.0
+        } else {
+            f32::from(data[(y as usize * source + x as usize) * 2 + channel])
+        }
+    };
     for y in 0..n {
+        let fy = (y as f32 + 0.5) * step - 0.5;
+        let y0 = fy.floor();
+        let wy = fy - y0;
+        let y0 = y0 as i32;
         for x in 0..n {
-            let sx = ((2 * x + 1) * source / (2 * n)).min(source - 1);
-            let sy = ((2 * y + 1) * source / (2 * n)).min(source - 1);
-            let offset = (kind_index(kind) * source * source + sy * source + sx) * 2;
-            let alpha = SYMBOL_LAYERS[slot][offset];
-            let inner = SYMBOL_LAYERS[slot][offset + 1];
-            image[y * n + x] = premultiplied(if inner > 0 { fill } else { rim }, alpha);
+            let fx = (x as f32 + 0.5) * step - 0.5;
+            let x0 = fx.floor();
+            let wx = fx - x0;
+            let x0 = x0 as i32;
+            let mut channels = [0u8; 2];
+            for (channel, value) in channels.iter_mut().enumerate() {
+                let top = texel(x0, y0, channel) * (1.0 - wx) + texel(x0 + 1, y0, channel) * wx;
+                let bottom =
+                    texel(x0, y0 + 1, channel) * (1.0 - wx) + texel(x0 + 1, y0 + 1, channel) * wx;
+                *value = (top * (1.0 - wy) + bottom * wy).round().clamp(0.0, 255.0) as u8;
+            }
+            output[y * n + x] = (channels[0], channels[1]);
         }
     }
-    image
+    output
 }
 
 fn kind_index(kind: DeviceKind) -> usize {
@@ -174,26 +249,6 @@ fn check_size(pixels: i32) -> Result<(), String> {
         Ok(())
     }
 }
-fn premultiplied(color: u32, alpha: u8) -> u32 {
-    let a = u32::from(alpha);
-    let r = (color & 255) * a / 255;
-    let g = ((color >> 8) & 255) * a / 255;
-    let b = ((color >> 16) & 255) * a / 255;
-    (a << 24) | (r << 16) | (g << 8) | b
-}
-fn layer_pixel(kind: DeviceKind, n: usize, x: usize, y: usize) -> (u8, u8) {
-    let slot = TRAY_SIZES
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, size)| size.abs_diff(n))
-        .map(|(slot, _)| slot)
-        .unwrap();
-    let source = TRAY_SIZES[slot];
-    let sx = ((2 * x + 1) * source / (2 * n)).min(source - 1);
-    let sy = ((2 * y + 1) * source / (2 * n)).min(source - 1);
-    let offset = (kind_index(kind) * source * source + sy * source + sx) * 2;
-    (TRAY_LAYERS[slot][offset], TRAY_LAYERS[slot][offset + 1])
-}
 fn meter_fill(n: usize, p: u8) -> usize {
     let value = (n - 4) * usize::from(p);
     let whole = value / 100;
@@ -207,13 +262,10 @@ fn tray_pixels(
     appearance: Appearance,
 ) -> Vec<u32> {
     let (rim, color, bg) = appearance.colors();
-    let mut image = vec![0; n * n];
-    for y in 0..n {
-        for x in 0..n {
-            let (alpha, inner) = layer_pixel(kind, n, x, y);
-            image[y * n + x] = premultiplied(if inner > 0 { color } else { rim }, alpha);
-        }
-    }
+    let mut image: Vec<u32> = sample_layer(&TRAY_LAYERS, &TRAY_SIZES, kind, n)
+        .into_iter()
+        .map(|(alpha, inner)| premultiplied(mix(rim, color, inner), alpha))
+        .collect();
     let gauge = if n <= 20 { 4 } else { 5 };
     let x = n - gauge;
     let top = 1;
@@ -362,6 +414,7 @@ fn high_contrast_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shapes::premultiplied;
     use windows_sys::Win32::{
         Graphics::Gdi::{CreateCompatibleDC, DeleteDC, GetDIBits},
         UI::WindowsAndMessaging::GetIconInfo,
@@ -384,6 +437,60 @@ mod tests {
         DeviceKind::Presenter,
         DeviceKind::Generic,
     ];
+
+    #[test]
+    fn sample_layer_averages_when_shrinking_and_interpolates_when_growing() {
+        // 4x4 coverage: opaque left half, transparent right half.
+        let mut data = vec![0u8; 4 * 4 * 2];
+        for y in 0..4 {
+            for x in 0..2 {
+                let at = (y * 4 + x) * 2;
+                data[at] = 255;
+                data[at + 1] = 255;
+            }
+        }
+        let layers: &[&[u8]] = &[&data];
+        let sizes = [4usize];
+        // Shrinking keeps the two halves at full coverage: an area average,
+        // not a point sample that would also land on 255 and 0 but shift the
+        // boundary. Every column pair collapses to one exact half.
+        let small = sample_layer(layers, &sizes, DeviceKind::Mouse, 2);
+        assert_eq!(small[0], (255, 255));
+        assert_eq!(small[1], (0, 0));
+        // Growing must interpolate: the seam pixel is partially covered
+        // instead of duplicating a source row.
+        let large = sample_layer(layers, &sizes, DeviceKind::Mouse, 8);
+        assert!(
+            large.iter().any(|(alpha, _)| (1..255).contains(alpha)),
+            "upscaling must antialias the seam"
+        );
+    }
+
+    #[test]
+    fn non_native_symbol_sizes_stay_antialiased() {
+        // 175% DPI asks for 28 * 168 / 96 = 49 pixels; nearest-neighbour
+        // sampling used to duplicate rows and leave the silhouette jagged.
+        for n in [49usize, 63, 70] {
+            let image = symbol_pixels(n, DeviceKind::Mouse, Appearance::Light);
+            assert!(
+                image.iter().any(|pixel| (1..255).contains(&(pixel >> 24))),
+                "missing antialiasing at {n}px"
+            );
+            // Upscaled rim and fill blend into each other, so only the solid
+            // interior is asserted here; exact colours stay a native-size
+            // guarantee. The glyph must still be present and opaque.
+            assert!(
+                image.iter().filter(|p| **p >> 24 == 255).count() > n * n / 8,
+                "silhouette collapsed at {n}px"
+            );
+            // Corners stay clear: the glyph never fills its square.
+            for edge in 0..n {
+                for index in [edge, (n - 1) * n + edge, edge * n, edge * n + n - 1] {
+                    assert_eq!(image[index], 0, "edge pixel {index} at {n}px");
+                }
+            }
+        }
+    }
     #[test]
     fn native_tray_pixels_equal_frozen_approved_reference_rasters() {
         let references = include_bytes!("../assets/generated/tray-v10-reference.bin");

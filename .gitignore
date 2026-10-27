@@ -8,3 +8,12 @@
 /dist/
 __pycache__/
 *.log
+
+# 本地凭据与密钥：任何情况下都不入库
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+secrets/
+

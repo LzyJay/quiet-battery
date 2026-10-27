@@ -13,7 +13,7 @@ from tray_art import tray as approved_tray, symbol as window_symbol, layers, gen
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "assets"
-SIZES = (16, 20, 24, 32, 48, 256)
+SIZES = (16, 20, 24, 28, 32, 40, 48, 56, 64, 256)
 THEMES = {
     "light": {"foreground": "#332F2A", "fill": "#985536", "track": "#C8C2B9", "background": "#F1F0EE"},
     "dark": {"foreground": "#F0ECE6", "fill": "#E7B18B", "track": "#69655F", "background": "#222222"},

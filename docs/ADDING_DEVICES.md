@@ -53,7 +53,7 @@ Registry 是集中入口。新增协议实现 `ProtocolAdapter` 的 `name`、`ow
 | `device` | 所选设备名称、通用类型、上次识别的适配器与逻辑端点；名称不等于已确认零售型号 |
 | `last_monitor_observation` | 点击时的监控快照、成功时间和错误；不把它当本次新查到的厂商电量，也不推进提醒周期 |
 | `hid.collections` | 所选物理组的全体相关集合，含vendor集合、VID/PID/release、usage、接口、Input/Output/Feature最大长度、字符串与字段来源/失败 |
-| `adapter_checks` | 静态profile与控制集合是否匹配、拒绝原因；匹配只确定查询入口，本次诊断不发厂商电量命令 |
+| `adapter_checks` | 每个内置厂商 profile（HID++、达摩鲨、COMPX、迈从鼠标、迈从耳机、雷蛇、DELUX）与控制集合是否匹配、拒绝原因；匹配只确定查询入口，本次诊断不发厂商电量命令 |
 | `bluetooth` | 仅关联同一物理身份的已配对BLE端点；已有许可且连接时查看180F、2A19/2BED、Read/Notify/Indicate和已有监控订阅，尝试标准读取 |
 
 未知字段保留null及原因。`no_matching_paired_ble_endpoint`不等于设备没有BAS，也不能排除经典蓝牙。HID长度是Windows集合最大长度（含report-ID槽位），不是每个报告的原始描述符或电量布局。蓝牙一项或可选2BED失败不会被误写成电池0%；可选特征错误单独记录，保留基本电量诊断证据。
