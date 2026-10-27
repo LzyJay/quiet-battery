@@ -320,7 +320,11 @@ pub fn reading_json(reading: &Reading) -> String {
         },
         reading.has_fine_estimate(),
         !reading.has_fine_estimate(),
-        if reading.metadata_known {
+        // A charge state is an observation, not protocol metadata: a device that
+        // only reports a percentage can still say it is charging.
+        if reading.metadata_known
+            || !matches!(reading.power_state, crate::device::PowerState::Unknown(_))
+        {
             json_string(&format!("{:?}", reading.power_state))
         } else {
             "null".into()
@@ -5198,6 +5202,26 @@ mod tests {
             }
         }
         assert_eq!(cell_fill(None, 0), 0);
+    }
+    #[test]
+    fn a_reported_charge_state_is_serialized_without_protocol_metadata() {
+        let charging = Reading::from_percent(
+            "Charging fixture".into(),
+            97,
+            crate::device::PowerState::Charging,
+        )
+        .unwrap();
+        let json = reading_json(&charging);
+        assert!(json.contains("\"power_state\":\"Charging\""), "{json}");
+        assert!(json.contains("\"metadata_known\":false"), "{json}");
+        // An unobserved state stays null instead of inventing a value.
+        let unknown = Reading::from_percent(
+            "Fixture".into(),
+            50,
+            crate::device::PowerState::Unknown(255),
+        )
+        .unwrap();
+        assert!(reading_json(&unknown).contains("\"power_state\":null"));
     }
     #[test]
     fn status_is_serialized_on_demand_without_files() {
