@@ -149,7 +149,15 @@ impl Manager {
                 }) {
                     state.unreadable = state.unreadable.saturating_add(1);
                     state.connection_known = true;
-                    state.connected = state.unreadable < UNREADABLE_LIMIT;
+                    // A frame that fails its own integrity check means the
+                    // receiver has nothing valid behind it: one pass is enough.
+                    // Silence may just be a sleeping device, so it needs two.
+                    let limit = if matches!(candidate.error, Some(DeviceError::Protocol(_))) {
+                        1
+                    } else {
+                        UNREADABLE_LIMIT
+                    };
+                    state.connected = state.unreadable < limit;
                     state.error = candidate.error.clone();
                     if candidate.descriptor.connection != Connection::Unknown {
                         // The link type is adapter evidence; a failed query does
@@ -1022,14 +1030,45 @@ mod tests {
             25
         );
     }
-    fn silent(id: &str) -> Candidate {
+    fn unreachable(id: &str, error: DeviceError) -> Candidate {
         let mut item = candidate(id, DeviceKind::Mouse, false);
         item.descriptor.recoverable = true;
         item.descriptor.endpoint = Some(id.into());
         item.descriptor.physical_id = id.into();
         item.reading = None;
-        item.error = Some(DeviceError::Unavailable("asleep".into()));
+        item.error = Some(error);
         item
+    }
+    fn silent(id: &str) -> Candidate {
+        unreachable(id, DeviceError::Unavailable("asleep".into()))
+    }
+    #[test]
+    fn an_invalid_frame_counts_as_disconnected_on_the_first_pass() {
+        let mut manager = Manager::default();
+        manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
+        // A receiver with nothing behind it answers with a frame that fails its
+        // own checksum. That is not silence and must not wait for a second pass.
+        manager.merge(
+            vec![unreachable(
+                "mouse",
+                DeviceError::Protocol("checksum mismatch".into()),
+            )],
+            200,
+        );
+        assert!(!manager.devices[0].connected);
+        assert_eq!(manager.visible().count(), 0);
+        assert_eq!(
+            std::mem::take(&mut manager.pending_connections),
+            vec![("mouse".to_owned(), false)]
+        );
+        assert_eq!(
+            manager.devices[0]
+                .reading
+                .as_ref()
+                .unwrap()
+                .normalized_percent(),
+            75
+        );
     }
     #[test]
     fn silent_receiver_hides_after_repeated_passes_and_announces_both_ways() {

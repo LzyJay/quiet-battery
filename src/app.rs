@@ -1961,6 +1961,12 @@ impl App {
                 self.layout_panel();
             }
             self.publish_view();
+            // Opening the window is the moment the user looks, so refresh the
+            // inventory now instead of showing a row that may be minutes old.
+            // A pass already in flight will update the same rows anyway.
+            if !self.busy {
+                self.discover();
+            }
             ShowWindow(self.panel, if cfg!(test) { SW_HIDE } else { SW_RESTORE });
             if !cfg!(test) {
                 SetForegroundWindow(self.panel);
