@@ -61,9 +61,10 @@ impl DeviceState {
     }
     /// A new discharge cycle starts when a charge is known to have finished:
     /// either the device left the charger while we watched it, or it came back
-    /// with a higher value than it had when the link dropped. `was_connected`
-    /// is the link state before this sample.
-    fn note_charge(&mut self, now: u64, was_connected: bool) {
+    /// from a confirmed link-down with a higher value than it had when the link
+    /// dropped. `resumed` means exactly that transition; a device that was never
+    /// seen before (or just loaded from disk) is not "coming back".
+    fn note_charge(&mut self, now: u64, resumed: bool) {
         let Some(reading) = self.reading.as_ref() else {
             return;
         };
@@ -77,8 +78,7 @@ impl DeviceState {
             state == PowerState::Charging
                 && matches!(power, PowerState::Discharging | PowerState::Full)
         });
-        let gained_while_away =
-            !was_connected && previous_percent.is_some_and(|before| percent > before);
+        let gained_while_away = resumed && previous_percent.is_some_and(|before| percent > before);
         if left_charger || gained_while_away || self.usage_since.is_none() {
             self.usage_since = Some(now);
         }
@@ -267,11 +267,11 @@ impl Manager {
                     state.last_success = Some(timestamp);
                     state.error = None;
                     state.answered();
-                    let was_connected = before
+                    let resumed = before
                         .iter()
                         .find(|(id, _, _)| *id == state.descriptor.id)
-                        .is_some_and(|(_, connected, _)| *connected);
-                    state.note_charge(timestamp, was_connected);
+                        .is_some_and(|(_, connected, known)| !*connected && *known);
+                    state.note_charge(timestamp, resumed);
                 } else if let Some(error) = &candidate.error {
                     state.silence(error, timestamp);
                 } else {
@@ -432,7 +432,7 @@ impl Manager {
                     if keep_value {
                         state.reading = Some(reading);
                         state.last_success = Some(timestamp);
-                        state.note_charge(timestamp, before.0);
+                        state.note_charge(timestamp, !before.0 && before.1);
                     }
                     state.error = None;
                     state.answered();
@@ -1327,6 +1327,25 @@ mod tests {
             700,
         );
         assert_eq!(manager.devices[0].usage_since, Some(300));
+    }
+    #[test]
+    fn a_restart_is_not_a_reconnect_and_must_not_reset_the_cycle() {
+        let mut manager = Manager::default();
+        manager.merge(
+            vec![charged_candidate("mouse", 80, PowerState::Discharging)],
+            100,
+        );
+        manager.devices[0].usage_since = Some(1_000);
+        // A fresh process loads the cache with an unknown link, so the first
+        // sample is a first sighting, not a reconnect: a higher value there is
+        // not evidence that a charge happened while we were away.
+        manager.devices[0].connected = false;
+        manager.devices[0].connection_known = false;
+        manager.merge(
+            vec![charged_candidate("mouse", 95, PowerState::Discharging)],
+            2_000,
+        );
+        assert_eq!(manager.devices[0].usage_since, Some(1_000));
     }
     #[test]
     fn leaving_the_charger_restarts_the_cycle_without_a_disconnect() {
