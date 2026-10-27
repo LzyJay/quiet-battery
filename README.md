@@ -4,7 +4,7 @@
 
 Windows 原生外设电量托盘工具。Rust + Win32，单 EXE，后台低频读取；按设备保存电量、托盘选择和低电提醒。
 
-**本地打包版本，不提供在线下载** · [设备扩展](docs/ADDING_DEVICES.md) · [商业授权](COMMERCIAL.md)
+**仓库只发源码，不提供二进制下载** · 克隆后见[构建与继续开发](#构建与继续开发) · [设备扩展](docs/ADDING_DEVICES.md) · [商业授权](COMMERCIAL.md)
 
 ## 使用
 
