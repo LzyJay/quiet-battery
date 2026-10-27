@@ -187,7 +187,6 @@ A：`./tools/build.ps1 -CheckOnly` 只做检查；`-SkipCopy` 会构建但不复
 
 ## 致谢
 
-- [2.4G-battery-viewer](https://github.com/yszyszysz233/2.4G-battery-viewer) —— 项目起点；本项目的 HID++、BAS 及 Compx/Razer 电量协议为 Rust 独立实现
 - Windows 自带的时钟/日历面板 —— 无标题栏弹出面板的交互参考
 
 ## 许可
