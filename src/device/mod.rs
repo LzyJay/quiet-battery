@@ -115,6 +115,14 @@ pub enum Connection {
     Direct,
 }
 impl Connection {
+    pub const ALL: [Self; 6] = [
+        Self::Unknown,
+        Self::Receiver,
+        Self::BluetoothClassic,
+        Self::BluetoothLe,
+        Self::Cable,
+        Self::Direct,
+    ];
     pub fn key(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -124,6 +132,9 @@ impl Connection {
             Self::Cable => "cable",
             Self::Direct => "direct",
         }
+    }
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.key() == key)
     }
     pub fn label(self) -> &'static str {
         match self {

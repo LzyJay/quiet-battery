@@ -145,6 +145,7 @@ impl Manager {
                             | "QuietBattery\t6"
                             | "QuietBattery\t7"
                             | "QuietBattery\t8"
+                            | "QuietBattery\t9"
                     )
                 ) {
                     return Err("设置文件格式无法识别，原文件未修改".into());
@@ -362,32 +363,45 @@ impl Manager {
             }
         }
     }
-    pub fn display_name(&self, id: &str, short: bool) -> String {
-        let Some(state) = self.devices.iter().find(|s| s.descriptor.id == id) else {
+    /// Label for one row. `peers` is the set of rows shown together, so a
+    /// disambiguating suffix only appears where two of them really collide —
+    /// never because some unrelated cached device happens to share the name.
+    /// `with_link` picks the suffix style: the link type when it tells the rows
+    /// apart, otherwise a short identity hash.
+    pub fn display_name(peers: &[DeviceState], id: &str, short: bool, with_link: bool) -> String {
+        let label = |state: &DeviceState| {
+            if short {
+                state.descriptor.short_name()
+            } else {
+                state.descriptor.name.clone()
+            }
+        };
+        let Some(state) = peers.iter().find(|s| s.descriptor.id == id) else {
             return String::new();
         };
-        let name = if short {
-            state.descriptor.short_name()
-        } else {
-            state.descriptor.name.clone()
-        };
-        if self.devices.iter().any(|other| {
-            other.descriptor.id != id
-                && (other.connected || other.selected)
-                && (if short {
-                    other.descriptor.short_name()
-                } else {
-                    other.descriptor.name.clone()
-                }) == name
+        let name = label(state);
+        if !peers.iter().any(|other| {
+            other.descriptor.id != id && (other.connected || other.selected) && label(other) == name
         }) {
-            format!(
-                "{name} · {:08X}",
-                id.bytes().fold(2166136261u32, |h, b| (h ^ u32::from(b))
-                    .wrapping_mul(16777619))
-            )
-        } else {
-            name
+            return name;
+        };
+        if with_link {
+            let link = state.descriptor.connection.short_label();
+            let shares_link = peers.iter().any(|other| {
+                other.descriptor.id != id
+                    && (other.connected || other.selected)
+                    && label(other) == name
+                    && other.descriptor.connection.short_label() == link
+            });
+            if !shares_link {
+                return format!("{name} · {link}");
+            }
         }
+        format!(
+            "{name} · {:08X}",
+            id.bytes().fold(2166136261u32, |h, b| (h ^ u32::from(b))
+                .wrapping_mul(16777619))
+        )
     }
     /// Battery read result: updates the value, the cache and the link.
     pub fn apply(&mut self, id: &str, result: Result<Reading, DeviceError>, timestamp: u64) {
@@ -487,7 +501,7 @@ impl Manager {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let mut text = format!(
-            "QuietBattery\t8\npreferences\t{}\t{}\t{}\t{}\t{}\n",
+            "QuietBattery\t9\npreferences\t{}\t{}\t{}\t{}\t{}\n",
             u8::from(self.notifications_enabled),
             self.threshold,
             u8::from(self.auto_refresh),
@@ -506,7 +520,7 @@ impl Manager {
                 _ => "percent".into(),
             };
             text.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 hex(&state.descriptor.id),
                 hex(&state.descriptor.name),
                 state.descriptor.kind.key(),
@@ -532,7 +546,8 @@ impl Manager {
                 state.alert.encode(),
                 state
                     .usage_since
-                    .map_or_else(|| "-".into(), |t| t.to_string())
+                    .map_or_else(|| "-".into(), |t| t.to_string()),
+                state.descriptor.connection.key()
             ));
         }
         let temporary = path.with_extension("tmp");
@@ -548,6 +563,7 @@ impl Manager {
             Some("QuietBattery\t6") => 6,
             Some("QuietBattery\t7") => 7,
             Some("QuietBattery\t8") => 8,
+            Some("QuietBattery\t9") => 9,
             _ => return manager,
         };
         let mut device_records = 0;
@@ -593,7 +609,8 @@ impl Manager {
                     4 => 12,
                     5 => 15,
                     6 | 7 => 17,
-                    _ => 18,
+                    8 => 18,
+                    _ => 19,
                 }
             {
                 continue;
@@ -716,9 +733,23 @@ impl Manager {
                     kind,
                     supported: flags[3],
                     provider: fields[10].to_owned(),
-                    // The link type is adapter evidence, not a persisted choice.
-                    // The next discovery repopulates it for present devices.
-                    connection: Connection::Unknown,
+                    connection: if version >= 9 {
+                        // The last link type this device was proven to use. It is
+                        // evidence, not a preference: an offline row keeps saying
+                        // "2.4G" instead of degrading to "unknown".
+                        match Connection::from_key(fields[18]) {
+                            Some(value) => value,
+                            None => continue,
+                        }
+                    } else {
+                        // Older files carry no column. Two adapters cannot report
+                        // anything but one link type, so their identity is enough.
+                        match fields[10] {
+                            "bthfp" => Connection::BluetoothClassic,
+                            "bas" => Connection::BluetoothLe,
+                            _ => Connection::Unknown,
+                        }
+                    },
                     endpoint: if version == 4 || fields[12] == "-" {
                         None
                     } else {
@@ -1114,7 +1145,10 @@ mod tests {
     fn duplicate_names_get_stable_suffix_only_when_needed() {
         let mut manager = Manager::default();
         manager.merge(vec![candidate("a", DeviceKind::Mouse, true)], 100);
-        assert_eq!(manager.display_name("a", true), "Peripheral");
+        assert_eq!(
+            Manager::display_name(&manager.devices, "a", true, true),
+            "Peripheral"
+        );
         manager.merge(
             vec![
                 candidate("a", DeviceKind::Mouse, true),
@@ -1122,11 +1156,57 @@ mod tests {
             ],
             101,
         );
+        // Two rows with the same model name in one list need a suffix…
+        let peers = manager.devices.clone();
         assert_ne!(
-            manager.display_name("a", true),
-            manager.display_name("b", true)
+            Manager::display_name(&peers, "a", true, true),
+            Manager::display_name(&peers, "b", true, true)
+        );
+        // …but a device that is not in this list does not create one.
+        let just_a: Vec<_> = peers.iter().take(1).cloned().collect();
+        assert_eq!(
+            Manager::display_name(&just_a, "a", true, true),
+            "Peripheral"
+        );
+        assert_eq!(
+            Manager::display_name(&just_a, "a", true, false),
+            "Peripheral"
         );
         assert_eq!(manager.devices[0].descriptor.short_name(), "Peripheral");
+    }
+    #[test]
+    fn duplicate_rows_use_the_link_type_not_a_hex_hash() {
+        let mut manager = Manager::default();
+        let mut bluetooth = candidate("same", DeviceKind::Headset, true);
+        bluetooth.descriptor.connection = Connection::BluetoothClassic;
+        manager.merge(vec![bluetooth], 100);
+        // A cached twin that is no longer present still occupies a settings row.
+        let mut twin = manager.devices[0].clone();
+        twin.descriptor.id = "same-2".into();
+        twin.descriptor.connection = Connection::Receiver;
+        twin.descriptor.name = manager.devices[0].descriptor.name.clone();
+        twin.connected = false;
+        twin.selected = true;
+        manager.devices.push(twin);
+
+        let peers = manager.devices.clone();
+        assert_eq!(
+            Manager::display_name(&peers, "same", true, true),
+            "Peripheral · 蓝牙"
+        );
+        assert_eq!(
+            Manager::display_name(&peers, "same-2", true, true),
+            "Peripheral · 2.4G"
+        );
+        // The main list only ever holds visible rows; with no twin in that set
+        // there is no suffix at all, whatever the style.
+        let alone: Vec<_> = peers.iter().take(1).cloned().collect();
+        for with_link in [false, true] {
+            assert_eq!(
+                Manager::display_name(&alone, "same", true, with_link),
+                "Peripheral"
+            );
+        }
     }
     #[test]
     fn malformed_cache_is_ignored() {
@@ -1403,6 +1483,48 @@ mod tests {
         );
         let migrated = Manager::decode(&old);
         assert_eq!(migrated.devices[0].usage_since, Some(5_000));
+    }
+    #[test]
+    fn the_link_type_survives_a_restart_and_old_rows_infer_it() {
+        let mut manager = Manager::default();
+        let mut headset = candidate("bt", DeviceKind::Headset, true);
+        headset.descriptor.provider = "bthfp".into();
+        headset.descriptor.connection = Connection::BluetoothClassic;
+        manager.merge(vec![headset], 100);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".build/tmp/link-{}.state", std::process::id()));
+        manager.save(&path);
+        let restored = Manager::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            restored.devices[0].descriptor.connection,
+            Connection::BluetoothClassic
+        );
+        // v8 has no column: the two single-transport adapters are still known,
+        // everything else stays unknown until it is seen again.
+        let metadata = encode_metadata(
+            &Reading::from_percent("Fixture".into(), 90, PowerState::Unknown(255)).unwrap(),
+        );
+        for (provider, expected) in [
+            ("bthfp", Connection::BluetoothClassic),
+            ("bas", Connection::BluetoothLe),
+            ("mchose", Connection::Unknown),
+        ] {
+            let text = format!(
+                "QuietBattery\t8\npreferences\t1\t20\t1\t120\t1\n{}\t{}\tmouse\t1\t0\t1\t90\t5000\tpercent\t1\t{}\t{}\t-\t1\t{}\t1\t0,-\t-\n",
+                hex("fixture-link"),
+                hex("Fixture"),
+                provider,
+                hex("fixture-physical"),
+                metadata,
+            );
+            let decoded = Manager::decode(&text);
+            assert_eq!(decoded.devices.len(), 1, "{provider}");
+            assert_eq!(
+                decoded.devices[0].descriptor.connection, expected,
+                "{provider}"
+            );
+        }
     }
     #[test]
     fn a_link_probe_moves_the_link_without_touching_the_value() {

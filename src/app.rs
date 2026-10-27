@@ -1073,7 +1073,7 @@ impl App {
             else {
                 continue;
             };
-            let name = self.manager.display_name(&id, true);
+            let name = Manager::display_name(&self.manager.devices, &id, true, true);
             let percent = state
                 .reading
                 .as_ref()
@@ -1671,7 +1671,12 @@ impl App {
                 row.id == s.descriptor.id
                     && row.presentation
                         == (
-                            self.manager.display_name(&s.descriptor.id, true),
+                            Manager::display_name(
+                                &states,
+                                &s.descriptor.id,
+                                true,
+                                self.page != Page::Main,
+                            ),
                             s.descriptor.name.clone(),
                             s.descriptor.kind,
                             s.descriptor.supported,
@@ -1688,7 +1693,12 @@ impl App {
         unsafe {
             let dpi = GetDpiForWindow(self.panel).max(96) as i32;
             for (index, state) in states.iter().enumerate() {
-                let name = self.manager.display_name(&state.descriptor.id, true);
+                let name = Manager::display_name(
+                    &states,
+                    &state.descriptor.id,
+                    true,
+                    self.page != Page::Main,
+                );
                 let model = create_child(
                     self.panel,
                     "STATIC",
@@ -3798,17 +3808,22 @@ pub fn run(mode: crate::launch::Mode) -> Result<(), String> {
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             CloseHandle(mutex);
-            for _ in 0..20 {
+            // The mutex is the authority: a second copy never starts, even if the
+            // first one is still building its window or cannot answer. Surface the
+            // running instance when we can, and stay silent otherwise — a login
+            // autostart collision must not raise a dialog.
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            loop {
                 let hwnd = find_window();
                 if !hwnd.is_null() {
-                    if PostMessageW(hwnd, CONTROL, mode.existing_command(), 0) == 0 {
-                        return Err("无法通知已有实例打开窗口".into());
-                    }
+                    let _ = PostMessageW(hwnd, CONTROL, mode.existing_command(), 0);
                     return Ok(());
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                if Instant::now() >= deadline {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            return Err("已有实例正在启动".into());
         }
         let result = run_owned(mode);
         ReleaseMutex(mutex);
