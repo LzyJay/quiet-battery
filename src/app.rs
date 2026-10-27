@@ -381,7 +381,44 @@ fn row_detail(state: &DeviceState) -> String {
             format!("{link} · 连接状态未知")
         };
     }
-    format!("{link} · {}", updated_age(state.last_success))
+    format!(
+        "{link} · {} · {}",
+        usage_text(state),
+        updated_age(state.last_success)
+    )
+}
+/// How long the current discharge cycle has been running. A charge is only
+/// claimed when the device said so, or when the value came back higher than the
+/// one recorded when the link dropped.
+fn usage_text(state: &DeviceState) -> String {
+    if state
+        .reading
+        .as_ref()
+        .is_some_and(|reading| reading.power_state == crate::device::PowerState::Charging)
+    {
+        return "充电中".into();
+    }
+    let Some(since) = state.usage_since else {
+        return "已使用—".into();
+    };
+    format!("已使用{}", short_duration(now().saturating_sub(since)))
+}
+fn short_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        "不到1分钟".into()
+    } else if seconds < 3_600 {
+        format!("{}分钟", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}小时", seconds / 3_600)
+    } else {
+        let days = seconds / 86_400;
+        let hours = seconds % 86_400 / 3_600;
+        if hours == 0 || days >= 10 {
+            format!("{days}天")
+        } else {
+            format!("{days}天{hours}小时")
+        }
+    }
 }
 fn updated_age(last: Option<u64>) -> String {
     let Some(time) = last else {
@@ -482,7 +519,7 @@ impl StatusView {
         let stale = first.is_none_or(|s| {
             s.error.is_some() || s.last_success.is_none_or(|t| now().saturating_sub(t) > 240)
         });
-        let devices=self.manager.devices.iter().map(|s|format!("{{\"id\":{},\"name\":{},\"kind\":{},\"connection\":{},\"supported\":{},\"selected\":{},\"removed\":{},\"show_tray\":{},\"tray_id\":{},\"connected\":{},\"last_success_unix\":{},\"reading\":{},\"error\":{}}}",json_string(&s.descriptor.id),json_string(&s.descriptor.name),json_string(s.descriptor.kind.key()),json_string(s.descriptor.connection.key()),s.descriptor.supported,s.selected,s.removed,s.show_tray,self.tray_ids.iter().find(|(id,_)|*id==s.descriptor.id).map_or_else(||"null".into(),|(_,id)|id.to_string()),s.connected,opt_number(s.last_success),s.reading.as_ref().map_or_else(||"null".into(),reading_json),s.error.as_ref().map_or_else(||"null".into(),|e|json_string(&e.to_string())))).collect::<Vec<_>>().join(",");
+        let devices=self.manager.devices.iter().map(|s|format!("{{\"id\":{},\"name\":{},\"kind\":{},\"connection\":{},\"supported\":{},\"selected\":{},\"removed\":{},\"show_tray\":{},\"tray_id\":{},\"connected\":{},\"last_success_unix\":{},\"usage_since_unix\":{},\"reading\":{},\"error\":{}}}",json_string(&s.descriptor.id),json_string(&s.descriptor.name),json_string(s.descriptor.kind.key()),json_string(s.descriptor.connection.key()),s.descriptor.supported,s.selected,s.removed,s.show_tray,self.tray_ids.iter().find(|(id,_)|*id==s.descriptor.id).map_or_else(||"null".into(),|(_,id)|id.to_string()),s.connected,opt_number(s.last_success),opt_number(s.usage_since),s.reading.as_ref().map_or_else(||"null".into(),reading_json),s.error.as_ref().map_or_else(||"null".into(),|e|json_string(&e.to_string())))).collect::<Vec<_>>().join(",");
         let startup = startup::status();
         let enabled = startup.as_ref().is_ok_and(|s| s.enabled);
         let value = format!(
@@ -5363,6 +5400,8 @@ mod tests {
                     connected: true,
                     connection_known: true,
                     silent_since: None,
+                    usage_since: None,
+                    last_seen: None,
                 });
             }
             app.show_panel();
@@ -5579,22 +5618,35 @@ mod tests {
             connected: false,
             connection_known: false,
             silent_since: None,
+            usage_since: None,
+            last_seen: None,
         };
         // Before the first discovery the link is genuinely unknown, never "down".
         assert_eq!(row_detail(&state), "2.4G · 连接状态未知");
         state.connection_known = true;
         assert_eq!(row_detail(&state), "2.4G · 未连接");
         state.connected = true;
-        assert_eq!(row_detail(&state), "2.4G · 尚未读取");
-        for (age, expected) in [
-            (0u64, "2.4G · 刚刚更新"),
-            (61, "2.4G · 1 分钟前"),
-            (7_200, "2.4G · 2 小时前"),
-            (180_000, "2.4G · 2 天前"),
+        assert_eq!(row_detail(&state), "2.4G · 已使用— · 尚未读取");
+        state.usage_since = Some(now().saturating_sub(3 * 86_400 + 5 * 3_600));
+        for (age, usage, expected) in [
+            (0u64, "3天5小时", "2.4G · 已使用3天5小时 · 刚刚更新"),
+            (61, "3天5小时", "2.4G · 已使用3天5小时 · 1 分钟前"),
+            (7_200, "3天5小时", "2.4G · 已使用3天5小时 · 2 小时前"),
+            (180_000, "3天5小时", "2.4G · 已使用3天5小时 · 2 天前"),
         ] {
             state.last_success = Some(now().saturating_sub(age));
-            assert_eq!(row_detail(&state), expected);
+            assert_eq!(row_detail(&state), expected, "usage {usage} age {age}");
         }
+        state.usage_since = Some(now().saturating_sub(42));
+        assert!(row_detail(&state).contains("已使用不到1分钟"));
+        state.usage_since = Some(now().saturating_sub(2 * 3_600 + 600));
+        assert!(row_detail(&state).contains("已使用2小时"));
+        // A connected device on the charger reports the charging state instead.
+        state.reading = Some(
+            Reading::from_percent("Detail".into(), 40, crate::device::PowerState::Charging)
+                .unwrap(),
+        );
+        assert!(row_detail(&state).contains("充电中"));
         state.descriptor.connection = crate::device::Connection::BluetoothClassic;
         assert!(row_detail(&state).starts_with("蓝牙 · "));
     }

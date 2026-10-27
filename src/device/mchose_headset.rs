@@ -93,12 +93,21 @@ fn parse(p: Profile, b: &[u8]) -> Result<Option<Reading>, DeviceError> {
     if payload[0] != PARAM_BATTERY {
         return Ok(None);
     }
-    let percent = payload[2];
+    let raw = payload[2];
+    // While charging the value byte packs a flag into bit 7 and keeps the
+    // percentage in the low bits: captured on hardware, 0x58 (88, cable
+    // unplugged) turned into 0xD8 when charging started and climbed to 0xD9
+    // as the battery filled. The middle status byte stayed 0x01 throughout,
+    // so its meaning remains unknown.
+    let (percent, state) = if raw & 0x80 != 0 {
+        (raw & 0x7F, PowerState::Charging)
+    } else {
+        (raw, PowerState::Unknown(255))
+    };
     if percent > 100 {
         return Err(DeviceError::Protocol("迈从耳机电量百分比超出范围".into()));
     }
-    // The status byte has no confirmed meaning, so charging stays unknown.
-    Reading::from_percent(p.name.into(), percent, PowerState::Unknown(255)).map(Some)
+    Reading::from_percent(p.name.into(), percent, state).map(Some)
 }
 fn query(p: Profile, io: &dyn Transport, cancel: &Cancellation) -> Result<Reading, DeviceError> {
     cancel.check()?;
@@ -197,6 +206,16 @@ mod tests {
             parse(profile(), &reply(89)).unwrap().unwrap().power_state,
             PowerState::Unknown(255)
         );
+        // Captured on hardware the moment charging started: bit 7 set, low
+        // bits unchanged, then one point higher two minutes into charging.
+        let charging = parse(profile(), &reply(0xd8)).unwrap().unwrap();
+        assert_eq!(charging.normalized_percent(), 88);
+        assert_eq!(charging.power_state, PowerState::Charging);
+        let climbing = parse(profile(), &reply(0xd9)).unwrap().unwrap();
+        assert_eq!(climbing.normalized_percent(), 89);
+        assert_eq!(climbing.power_state, PowerState::Charging);
+        // The middle status byte stayed 0x01 across both captures.
+        assert_eq!(reply(0xd8)[8], 0x01);
     }
     #[test]
     fn wire_contract_boundaries_checksum_and_unrelated_packets() {
@@ -222,8 +241,19 @@ mod tests {
                 p
             );
         }
-        for p in 101..=255 {
-            assert!(parse(profile(), &reply(p)).is_err());
+        // Without bit 7 the value must stay a plain percentage.
+        for p in 101..=127 {
+            assert!(parse(profile(), &reply(p)).is_err(), "plain {p} accepted");
+        }
+        // Bit 7 flags charging; the low bits remain a 0-100 percentage.
+        for p in 128..=228 {
+            let r = parse(profile(), &reply(p)).unwrap().unwrap();
+            assert_eq!(r.normalized_percent(), p - 128, "charging {p}");
+            assert_eq!(r.power_state, PowerState::Charging);
+        }
+        // Beyond that the low bits stop being a valid percentage.
+        for p in 229..=255 {
+            assert!(parse(profile(), &reply(p)).is_err(), "packed {p} accepted");
         }
         // The echo carries a one-byte payload and must never become 0%.
         assert!(parse(profile(), &request()).unwrap().is_none());

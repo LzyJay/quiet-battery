@@ -24,6 +24,13 @@ pub struct DeviceState {
     /// stays on the bus while the mouse behind it is off, so only the query can
     /// tell "off" from "present". Transient, never persisted.
     pub silent_since: Option<u64>,
+    /// Start of the current discharge cycle, i.e. when the battery was last
+    /// charged. Persisted: an idle period with the device switched off still
+    /// counts as "in use" unless the value went up while it was away.
+    pub usage_since: Option<u64>,
+    /// Last value/power pair seen while linked, used to recognise a completed
+    /// charge. Transient, rebuilt from the cached reading on load.
+    pub last_seen: Option<(u8, PowerState)>,
 }
 /// How long a device may stay silent (timeout, not an invalid frame) before the
 /// link is treated as down. Long enough to ride out one dropped frame, short
@@ -51,6 +58,38 @@ impl DeviceState {
         self.connected = true;
         self.connection_known = true;
         self.silent_since = None;
+    }
+    /// A new discharge cycle starts when a charge is known to have finished:
+    /// either the device left the charger while we watched it, or it came back
+    /// with a higher value than it had when the link dropped. `was_connected`
+    /// is the link state before this sample.
+    fn note_charge(&mut self, now: u64, was_connected: bool) {
+        let Some(reading) = self.reading.as_ref() else {
+            return;
+        };
+        let percent = reading.normalized_percent();
+        let power = reading.power_state;
+        let (previous_percent, previous_power) = match self.last_seen {
+            Some((value, state)) => (Some(value), Some(state)),
+            None => (None, None),
+        };
+        let left_charger = previous_power.is_some_and(|state| {
+            state == PowerState::Charging
+                && matches!(power, PowerState::Discharging | PowerState::Full)
+        });
+        let gained_while_away =
+            !was_connected && previous_percent.is_some_and(|before| percent > before);
+        if left_charger || gained_while_away || self.usage_since.is_none() {
+            self.usage_since = Some(now);
+        }
+        // Percent always follows the newest reading; power keeps the last known
+        // value so an Unknown sample cannot hide a charge that ended.
+        let power = if matches!(power, PowerState::Unknown(_)) {
+            previous_power.unwrap_or(power)
+        } else {
+            power
+        };
+        self.last_seen = Some((percent, power));
     }
 }
 #[derive(Clone)]
@@ -105,6 +144,7 @@ impl Manager {
                             | "QuietBattery\t5"
                             | "QuietBattery\t6"
                             | "QuietBattery\t7"
+                            | "QuietBattery\t8"
                     )
                 ) {
                     return Err("设置文件格式无法识别，原文件未修改".into());
@@ -227,6 +267,11 @@ impl Manager {
                     state.last_success = Some(timestamp);
                     state.error = None;
                     state.answered();
+                    let was_connected = before
+                        .iter()
+                        .find(|(id, _, _)| *id == state.descriptor.id)
+                        .is_some_and(|(_, connected, _)| *connected);
+                    state.note_charge(timestamp, was_connected);
                 } else if let Some(error) = &candidate.error {
                     state.silence(error, timestamp);
                 } else {
@@ -250,6 +295,10 @@ impl Manager {
                         ));
                     }
                 }
+                let last_seen = candidate
+                    .reading
+                    .as_ref()
+                    .map(|reading| (reading.normalized_percent(), reading.power_state));
                 self.devices.push(DeviceState {
                     descriptor: candidate.descriptor,
                     selected: automatic,
@@ -263,6 +312,10 @@ impl Manager {
                     connected: true,
                     connection_known: true,
                     silent_since: None,
+                    // First sighting starts the clock: we have no older charge
+                    // evidence, and a blank field would be less useful.
+                    usage_since: success.then_some(timestamp),
+                    last_seen,
                 });
             }
         }
@@ -379,6 +432,7 @@ impl Manager {
                     if keep_value {
                         state.reading = Some(reading);
                         state.last_success = Some(timestamp);
+                        state.note_charge(timestamp, before.0);
                     }
                     state.error = None;
                     state.answered();
@@ -433,7 +487,7 @@ impl Manager {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let mut text = format!(
-            "QuietBattery\t7\npreferences\t{}\t{}\t{}\t{}\t{}\n",
+            "QuietBattery\t8\npreferences\t{}\t{}\t{}\t{}\t{}\n",
             u8::from(self.notifications_enabled),
             self.threshold,
             u8::from(self.auto_refresh),
@@ -452,7 +506,7 @@ impl Manager {
                 _ => "percent".into(),
             };
             text.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 hex(&state.descriptor.id),
                 hex(&state.descriptor.name),
                 state.descriptor.kind.key(),
@@ -475,7 +529,10 @@ impl Manager {
                 u8::from(state.descriptor.recoverable),
                 reading.map_or_else(|| "-".into(), encode_metadata),
                 u8::from(state.notify),
-                state.alert.encode()
+                state.alert.encode(),
+                state
+                    .usage_since
+                    .map_or_else(|| "-".into(), |t| t.to_string())
             ));
         }
         let temporary = path.with_extension("tmp");
@@ -490,13 +547,14 @@ impl Manager {
             Some("QuietBattery\t5") => 5,
             Some("QuietBattery\t6") => 6,
             Some("QuietBattery\t7") => 7,
+            Some("QuietBattery\t8") => 8,
             _ => return manager,
         };
         let mut device_records = 0;
         for line in lines.take(1024) {
             let fields: Vec<_> = line.split('\t').collect();
             if fields.first() == Some(&"preferences") {
-                if version == 7 {
+                if version >= 7 {
                     if fields.len() == 6
                         && matches!(fields[1], "0" | "1")
                         && fields[2]
@@ -534,7 +592,8 @@ impl Manager {
                 != match version {
                     4 => 12,
                     5 => 15,
-                    _ => 17,
+                    6 | 7 => 17,
+                    _ => 18,
                 }
             {
                 continue;
@@ -630,6 +689,22 @@ impl Manager {
             if reading.is_some() != last_success.is_some() {
                 continue;
             }
+            // v8 stores the discharge-cycle start. Older files start the clock
+            // at the last confirmed reading, which is the best evidence they have.
+            let usage_since = if version >= 8 {
+                match fields[17] {
+                    "-" => None,
+                    text => match text.parse::<u64>() {
+                        Ok(time) if time <= now.saturating_add(300) => Some(time),
+                        _ => continue,
+                    },
+                }
+            } else {
+                last_success
+            };
+            let last_seen = reading
+                .as_ref()
+                .map(|reading| (reading.normalized_percent(), reading.power_state));
             manager.devices.push(DeviceState {
                 descriptor: DeviceDescriptor {
                     physical_id: match unhex(fields[11]) {
@@ -688,6 +763,8 @@ impl Manager {
                 connected: false,
                 connection_known: false,
                 silent_since: None,
+                usage_since,
+                last_seen,
             });
         }
         manager
@@ -1212,6 +1289,101 @@ mod tests {
             std::mem::take(&mut manager.pending_connections),
             vec![("mouse".to_owned(), true)]
         );
+    }
+    fn charged_candidate(id: &str, percent: u8, power: PowerState) -> Candidate {
+        let mut item = candidate(id, DeviceKind::Mouse, true);
+        item.reading = Some(Reading::from_percent("Peripheral".into(), percent, power).unwrap());
+        item
+    }
+    fn gone(id: &str) -> Candidate {
+        unreachable(id, DeviceError::NotFound)
+    }
+    #[test]
+    fn a_higher_value_after_a_disconnect_starts_a_new_usage_cycle() {
+        let mut manager = Manager::default();
+        manager.merge(
+            vec![charged_candidate("mouse", 90, PowerState::Discharging)],
+            100,
+        );
+        assert_eq!(manager.devices[0].usage_since, Some(100));
+        // Value recorded at disconnect is the cached one: 90%.
+        manager.merge(vec![gone("mouse")], 200);
+        assert!(!manager.devices[0].connected);
+        manager.merge(
+            vec![charged_candidate("mouse", 96, PowerState::Discharging)],
+            300,
+        );
+        assert_eq!(manager.devices[0].usage_since, Some(300));
+        // Same value, or a lower one, is not a charge.
+        manager.merge(vec![gone("mouse")], 400);
+        manager.merge(
+            vec![charged_candidate("mouse", 96, PowerState::Discharging)],
+            500,
+        );
+        assert_eq!(manager.devices[0].usage_since, Some(300));
+        manager.merge(vec![gone("mouse")], 600);
+        manager.merge(
+            vec![charged_candidate("mouse", 80, PowerState::Discharging)],
+            700,
+        );
+        assert_eq!(manager.devices[0].usage_since, Some(300));
+    }
+    #[test]
+    fn leaving_the_charger_restarts_the_cycle_without_a_disconnect() {
+        let mut manager = Manager::default();
+        manager.merge(
+            vec![charged_candidate("mouse", 40, PowerState::Charging)],
+            100,
+        );
+        assert_eq!(manager.devices[0].usage_since, Some(100));
+        manager.merge(
+            vec![charged_candidate("mouse", 55, PowerState::Charging)],
+            200,
+        );
+        assert_eq!(manager.devices[0].usage_since, Some(100));
+        manager.merge(vec![charged_candidate("mouse", 100, PowerState::Full)], 300);
+        assert_eq!(manager.devices[0].usage_since, Some(300));
+        // An unknown sample in between must not hide the charger edge.
+        manager.merge(
+            vec![charged_candidate("mouse", 90, PowerState::Charging)],
+            400,
+        );
+        manager.merge(
+            vec![charged_candidate("mouse", 90, PowerState::Unknown(255))],
+            500,
+        );
+        manager.merge(
+            vec![charged_candidate("mouse", 90, PowerState::Discharging)],
+            600,
+        );
+        assert_eq!(manager.devices[0].usage_since, Some(600));
+    }
+    #[test]
+    fn usage_cycle_survives_a_restart_and_older_files_start_at_the_last_reading() {
+        let mut manager = Manager::default();
+        manager.merge(vec![candidate("opaque", DeviceKind::Mouse, true)], 100);
+        manager.devices[0].usage_since = Some(4_242);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".build/tmp/usage-{}.state", std::process::id()));
+        manager.save(&path);
+        let restored = Manager::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(restored.devices[0].usage_since, Some(4_242));
+        // A v7 record has no field for it: the last confirmed reading is the best
+        // starting point, and the clock keeps running from there.
+        let id = "fixture-usage";
+        let metadata = encode_metadata(
+            &Reading::from_percent("Fixture".into(), 90, PowerState::Unknown(255)).unwrap(),
+        );
+        let old = format!(
+            "QuietBattery\t7\npreferences\t1\t20\t1\t120\t1\n{}\t{}\tmouse\t1\t0\t1\t90\t5000\tpercent\t1\tfixture\t{}\t-\t1\t{}\t1\t0,-\n",
+            hex(id),
+            hex("Fixture"),
+            hex("fixture-physical"),
+            metadata,
+        );
+        let migrated = Manager::decode(&old);
+        assert_eq!(migrated.devices[0].usage_since, Some(5_000));
     }
     #[test]
     fn a_link_probe_moves_the_link_without_touching_the_value() {
