@@ -42,6 +42,10 @@ const CONTROL: u32 = WM_APP + 1;
 const RESULT: u32 = WM_APP + 2;
 const TRAY: u32 = WM_APP + 3;
 const EVENTS_READY: u32 = WM_APP + 4;
+/// Link check cadence. Separate from the battery refresh interval: one query per
+/// monitored device, no enumeration and no BLE scan.
+const PRESENCE_TIMER: usize = 4;
+const PRESENCE_MILLIS: u32 = 15_000;
 pub const REFRESH: usize = 1;
 pub const QUIT: usize = 2;
 pub const SIMULATE_ERROR: usize = 3;
@@ -96,12 +100,16 @@ impl Page {
 enum WorkerCommand {
     Discover(bool),
     Read(Vec<String>, bool),
+    /// Link-only probe: the reply is used for connection state, not for the
+    /// displayed percentage.
+    Link(Vec<String>, bool),
     Support(u64, Box<SupportContext>, SupportDestination, Cancellation),
     Stop,
 }
 enum WorkerResult {
     Discovery(Result<DiscoveryReport, DeviceError>),
     Reading(String, Result<Reading, DeviceError>),
+    LinkRead(String, Result<Reading, DeviceError>),
     Complete,
     RefreshRequest(String),
     Support(u64, Result<Option<String>, DeviceError>),
@@ -195,6 +203,7 @@ enum UiEvent {
     Settings,
     Scroll(i32),
     PageCommand(u32),
+    Presence,
     Threshold(bool),
     ThresholdEdited,
     Interval(bool),
@@ -665,6 +674,22 @@ impl App {
     }
     /// `rescan` lets an explicit user or power event rediscover when nothing is
     /// currently present; the input-driven path must stay cheap.
+    /// Cheap link check: query every monitored device once, including the ones
+    /// currently hidden, so a power switch shows up in seconds instead of at the
+    /// next battery refresh. No enumeration, no BLE scan, no writes.
+    fn presence(&mut self) {
+        if self.busy {
+            return;
+        }
+        let ids: Vec<_> = self
+            .manager
+            .selected()
+            .map(|s| s.descriptor.id.clone())
+            .collect();
+        if !ids.is_empty() {
+            self.read_ids(ids, true);
+        }
+    }
     /// `rescan` lets an explicit user or power event rediscover when nothing is
     /// currently present; the input-driven path has to stay cheap.
     fn refresh(&mut self, rescan: bool) {
@@ -684,21 +709,30 @@ impl App {
         self.refresh_ids(ids);
     }
     fn refresh_ids(&mut self, ids: Vec<String>) {
+        self.read_ids(ids, false);
+    }
+    /// `link` selects the link-only probe, which never replaces the displayed
+    /// percentage or its timestamp.
+    fn read_ids(&mut self, ids: Vec<String>, link: bool) {
         if self.busy {
-            self.pending = true;
+            // A probe is cheap to skip; a value refresh must not be dropped.
+            self.pending |= !link;
             return;
         }
         if ids.is_empty() {
-            self.discover();
+            if !link {
+                self.discover();
+            }
             return;
         }
         self.busy = true;
         self.refresh_count += 1;
-        if self
-            .sender
-            .send(WorkerCommand::Read(ids, self.simulated))
-            .is_err()
-        {
+        let command = if link {
+            WorkerCommand::Link(ids, self.simulated)
+        } else {
+            WorkerCommand::Read(ids, self.simulated)
+        };
+        if self.sender.send(command).is_err() {
             self.busy = false;
         }
         self.publish_view();
@@ -739,6 +773,9 @@ impl App {
                     }
                     WorkerResult::Reading(id, _) => {
                         WorkerResult::Reading(id, Err(simulated_error()))
+                    }
+                    WorkerResult::LinkRead(id, _) => {
+                        WorkerResult::LinkRead(id, Err(simulated_error()))
                     }
                     WorkerResult::Complete => WorkerResult::Complete,
                     WorkerResult::RefreshRequest(id) => WorkerResult::RefreshRequest(id),
@@ -788,6 +825,11 @@ impl App {
                     self.persist();
                     self.rebuild_rows();
                 }
+                // Link probes never touch the cached value, so they need no save.
+                WorkerResult::LinkRead(id, result) => {
+                    self.manager.apply_link(&id, result, now());
+                    self.rebuild_rows();
+                }
                 WorkerResult::Complete => {
                     self.busy = false;
                     if self.pending_discovery {
@@ -804,9 +846,13 @@ impl App {
             self.update_icons(false);
             if fresh_result {
                 self.deliver_alerts();
-                self.deliver_connections();
             } else {
                 self.prune_alerts();
+            }
+            // A link transition can be queued by a failed query as well, so it is
+            // not tied to a successful reading.
+            if !self.manager.pending_connections.is_empty() {
+                self.deliver_connections();
             }
             self.publish_view();
         }
@@ -2447,6 +2493,7 @@ impl App {
                     self.publish_view();
                 }
                 UiEvent::Refresh => self.refresh(true),
+                UiEvent::Presence => self.presence(),
                 UiEvent::Discover => self.discover(),
                 UiEvent::Activity => {
                     self.bridge.activity_queued.set(false);
@@ -2568,6 +2615,7 @@ impl App {
         unsafe {
             KillTimer(self.hwnd, 1);
             KillTimer(self.hwnd, 2);
+            KillTimer(self.hwnd, PRESENCE_TIMER);
         }
         self.close_picker();
         self.close_panel();
@@ -3238,6 +3286,7 @@ unsafe extern "system" fn window_proc(
         CONTROL => UiEvent::Control(wparam),
         RESULT => UiEvent::Result,
         WM_TIMER if wparam == 2 => UiEvent::Heartbeat,
+        WM_TIMER if wparam == PRESENCE_TIMER => UiEvent::Presence,
         WM_TIMER => UiEvent::Discover,
         WM_DEVICECHANGE => UiEvent::Discover,
         WM_INPUT => {
@@ -3822,6 +3871,7 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
                     if worker_stop.check().is_err() {
                         break;
                     }
+                    let link_batch = matches!(&command, WorkerCommand::Link(..));
                     match command {
                         WorkerCommand::Stop => break,
                         WorkerCommand::Discover(simulated) => {
@@ -3859,7 +3909,8 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
                             })();
                             let _ = results.send(WorkerResult::Support(token, result));
                         }
-                        WorkerCommand::Read(ids, simulated) => {
+                        WorkerCommand::Read(ids, simulated)
+                        | WorkerCommand::Link(ids, simulated) => {
                             for id in ids {
                                 if worker_stop.check().is_err() {
                                     break;
@@ -3869,7 +3920,12 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
                                 } else {
                                     Registry::read_cancelled(&id, &worker_stop)
                                 };
-                                if results.send(WorkerResult::Reading(id, result)).is_err() {
+                                let result = if link_batch {
+                                    WorkerResult::LinkRead(id, result)
+                                } else {
+                                    WorkerResult::Reading(id, result)
+                                };
+                                if results.send(result).is_err() {
                                     return;
                                 }
                                 PostMessageW(target as HWND, RESULT, 0, 0);
@@ -3958,7 +4014,10 @@ unsafe fn run_owned(mode: crate::launch::Mode) -> Result<(), String> {
             2,
             std::mem::size_of::<RAWINPUTDEVICE>() as u32,
         );
-        if SetTimer(hwnd, 2, 30_000, None) == 0 || !app.apply_refresh_timer() {
+        if SetTimer(hwnd, 2, 30_000, None) == 0
+            || SetTimer(hwnd, PRESENCE_TIMER, PRESENCE_MILLIS, None) == 0
+            || !app.apply_refresh_timer()
+        {
             app.quit();
             return Err("无法启动刷新定时器".into());
         }
@@ -5303,7 +5362,7 @@ mod tests {
                     error: None,
                     connected: true,
                     connection_known: true,
-                    unreadable: 0,
+                    silent_since: None,
                 });
             }
             app.show_panel();
@@ -5519,7 +5578,7 @@ mod tests {
             error: None,
             connected: false,
             connection_known: false,
-            unreadable: 0,
+            silent_since: None,
         };
         // Before the first discovery the link is genuinely unknown, never "down".
         assert_eq!(row_detail(&state), "2.4G · 连接状态未知");

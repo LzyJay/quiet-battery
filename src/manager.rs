@@ -20,14 +20,39 @@ pub struct DeviceState {
     pub error: Option<DeviceError>,
     pub connected: bool,
     pub connection_known: bool,
-    /// Consecutive discovery passes that enumerated the device but got no reply.
-    /// A receiver stays on the bus while the mouse behind it is switched off, so
-    /// enumeration alone cannot tell "off" from "present"; only repeated silence
-    /// can. Transient, never persisted.
-    pub unreadable: u32,
+    /// Unix time of the first failed query since the last good one. A receiver
+    /// stays on the bus while the mouse behind it is off, so only the query can
+    /// tell "off" from "present". Transient, never persisted.
+    pub silent_since: Option<u64>,
 }
-/// Passes without a reply before a present-but-silent device counts as disconnected.
-pub const UNREADABLE_LIMIT: u32 = 2;
+/// How long a device may stay silent (timeout, not an invalid frame) before the
+/// link is treated as down. Long enough to ride out one dropped frame, short
+/// enough that a powered-off device does not linger.
+pub const SILENT_GRACE_SECONDS: u64 = 30;
+impl DeviceState {
+    /// A failed query is evidence about the link, never about the value.
+    fn silence(&mut self, error: &DeviceError, now: u64) {
+        self.connection_known = true;
+        self.error = Some(error.clone());
+        if matches!(error, DeviceError::Protocol(_) | DeviceError::NotFound) {
+            // The device answered with something invalid, or the adapter could
+            // not find it at all: nothing is behind this endpoint right now.
+            self.connected = false;
+            self.silent_since = None;
+            return;
+        }
+        let since = *self.silent_since.get_or_insert(now);
+        // Inside the grace window the link is still presumed up: one dropped
+        // query is not a disconnect, and the merge pass has just cleared the
+        // flag for every device it did not see.
+        self.connected = now.saturating_sub(since) < SILENT_GRACE_SECONDS;
+    }
+    fn answered(&mut self) {
+        self.connected = true;
+        self.connection_known = true;
+        self.silent_since = None;
+    }
+}
 #[derive(Clone)]
 pub struct Manager {
     pub devices: Vec<DeviceState>,
@@ -147,18 +172,14 @@ impl Manager {
                         && (candidate.descriptor.endpoint.is_none()
                             || state.descriptor.endpoint == candidate.descriptor.endpoint)
                 }) {
-                    state.unreadable = state.unreadable.saturating_add(1);
-                    state.connection_known = true;
-                    // A frame that fails its own integrity check means the
-                    // receiver has nothing valid behind it: one pass is enough.
-                    // Silence may just be a sleeping device, so it needs two.
-                    let limit = if matches!(candidate.error, Some(DeviceError::Protocol(_))) {
-                        1
-                    } else {
-                        UNREADABLE_LIMIT
-                    };
-                    state.connected = state.unreadable < limit;
-                    state.error = candidate.error.clone();
+                    match &candidate.error {
+                        Some(error) => state.silence(error, timestamp),
+                        None => {
+                            // Present but unsupported: no link evidence either way.
+                            state.connected = true;
+                            state.connection_known = true;
+                        }
+                    }
                     if candidate.descriptor.connection != Connection::Unknown {
                         // The link type is adapter evidence; a failed query does
                         // not invalidate it.
@@ -191,7 +212,6 @@ impl Manager {
                     state.descriptor = candidate.descriptor;
                 }
                 if let Some(reading) = candidate.reading {
-                    state.unreadable = 0;
                     if state.alert.observe(
                         &reading,
                         self.threshold,
@@ -206,8 +226,11 @@ impl Manager {
                     state.reading = Some(reading);
                     state.last_success = Some(timestamp);
                     state.error = None;
+                    state.answered();
+                } else if let Some(error) = &candidate.error {
+                    state.silence(error, timestamp);
                 } else {
-                    state.error = candidate.error;
+                    state.error = None;
                 }
             } else {
                 let automatic = candidate.descriptor.supported
@@ -239,7 +262,7 @@ impl Manager {
                     error: candidate.error,
                     connected: true,
                     connection_known: true,
-                    unreadable: 0,
+                    silent_since: None,
                 });
             }
         }
@@ -313,37 +336,69 @@ impl Manager {
             name
         }
     }
+    /// Battery read result: updates the value, the cache and the link.
     pub fn apply(&mut self, id: &str, result: Result<Reading, DeviceError>, timestamp: u64) {
+        self.apply_inner(id, result, timestamp, true);
+    }
+    /// Link probe result: only the connection state moves. The battery value and
+    /// its timestamp stay on the refresh cadence, otherwise the 15 s presence
+    /// check would silently replace the user's refresh interval.
+    pub fn apply_link(&mut self, id: &str, result: Result<Reading, DeviceError>, timestamp: u64) {
+        self.apply_inner(id, result, timestamp, false);
+    }
+    fn apply_inner(
+        &mut self,
+        id: &str,
+        result: Result<Reading, DeviceError>,
+        timestamp: u64,
+        keep_value: bool,
+    ) {
+        let Some(index) = self.devices.iter().position(|s| s.descriptor.id == id) else {
+            return;
+        };
+        let before = (
+            self.devices[index].connected,
+            self.devices[index].connection_known,
+        );
         if let Some(state) = self.devices.iter_mut().find(|s| s.descriptor.id == id) {
             match result {
                 Ok(reading) => {
-                    if state.alert.observe(
-                        &reading,
-                        self.threshold,
-                        self.notifications_enabled && state.notify && state.selected,
-                    ) {
+                    if keep_value
+                        && state.alert.observe(
+                            &reading,
+                            self.threshold,
+                            self.notifications_enabled && state.notify && state.selected,
+                        )
+                    {
                         self.pending_alerts.push((
                             state.descriptor.id.clone(),
                             state.descriptor.name.clone(),
                             reading.normalized_percent(),
                         ));
                     }
-                    state.reading = Some(reading);
-                    state.last_success = Some(timestamp);
-                    state.error = None;
-                    state.connected = true;
-                    state.connection_known = true;
-                    state.unreadable = 0;
-                }
-                Err(error) => {
-                    if matches!(error, DeviceError::NotFound) {
-                        state.connected = false;
-                        state.connection_known = true;
-                        state.unreadable = 0;
+                    if keep_value {
+                        state.reading = Some(reading);
+                        state.last_success = Some(timestamp);
                     }
-                    state.error = Some(error);
+                    state.error = None;
+                    state.answered();
                 }
+                // Shutdown is not evidence about the device.
+                Err(DeviceError::Cancelled) => {}
+                Err(error) => state.silence(&error, timestamp),
             }
+        }
+        let state = &self.devices[index];
+        if self.connection_baseline
+            && self.connection_notifications
+            && state.selected
+            && !state.removed
+            && before.1
+            && state.connection_known
+            && before.0 != state.connected
+        {
+            self.pending_connections
+                .push((state.descriptor.id.clone(), state.connected));
         }
     }
     pub fn select(&mut self, id: &str) -> bool {
@@ -632,7 +687,7 @@ impl Manager {
                 error: None,
                 connected: false,
                 connection_known: false,
-                unreadable: 0,
+                silent_since: None,
             });
         }
         manager
@@ -1106,14 +1161,94 @@ mod tests {
         );
     }
     #[test]
-    fn one_late_reply_resets_the_silence_counter() {
+    fn one_late_reply_restarts_the_silence_window() {
         let mut manager = Manager::default();
         manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
         manager.merge(vec![silent("mouse")], 200);
+        assert_eq!(manager.devices[0].silent_since, Some(200));
         manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 300);
+        assert_eq!(manager.devices[0].silent_since, None);
+        // A reply in between means the next silence starts a fresh grace window.
         manager.merge(vec![silent("mouse")], 400);
         assert!(manager.devices[0].connected);
-        assert_eq!(manager.devices[0].unreadable, 1);
+        assert_eq!(manager.devices[0].silent_since, Some(400));
+    }
+    #[test]
+    fn only_a_timeout_waits_for_the_grace_window() {
+        let mut manager = Manager::default();
+        manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
+        manager.merge(vec![silent("mouse")], 200);
+        assert!(manager.devices[0].connected);
+        manager.merge(vec![silent("mouse")], 220);
+        assert!(manager.devices[0].connected);
+        manager.merge(vec![silent("mouse")], 231);
+        assert!(!manager.devices[0].connected);
+        assert_eq!(manager.visible().count(), 0);
+    }
+    #[test]
+    fn a_presence_read_also_drives_the_link_and_announces_both_ways() {
+        let mut manager = Manager::default();
+        manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
+        assert!(!manager.devices[0].silent_since.is_some());
+        // The 15 s presence poll reports a frame that fails its checksum.
+        manager.apply_link(
+            "mouse",
+            Err(DeviceError::Protocol("checksum mismatch".into())),
+            120,
+        );
+        assert!(!manager.devices[0].connected);
+        assert_eq!(
+            std::mem::take(&mut manager.pending_connections),
+            vec![("mouse".to_owned(), false)]
+        );
+        // The next poll gets a valid frame back.
+        manager.apply_link(
+            "mouse",
+            Ok(Reading::from_percent("Peripheral".into(), 74, PowerState::Discharging).unwrap()),
+            135,
+        );
+        assert!(manager.devices[0].connected);
+        assert_eq!(
+            std::mem::take(&mut manager.pending_connections),
+            vec![("mouse".to_owned(), true)]
+        );
+    }
+    #[test]
+    fn a_link_probe_moves_the_link_without_touching_the_value() {
+        let mut manager = Manager::default();
+        manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
+        let shown = manager.devices[0]
+            .reading
+            .as_ref()
+            .unwrap()
+            .normalized_percent();
+        manager.apply_link(
+            "mouse",
+            Ok(Reading::from_percent("Peripheral".into(), 12, PowerState::Discharging).unwrap()),
+            200,
+        );
+        assert!(manager.devices[0].connected);
+        // The 15 s probe must not turn the 2 minute value cadence into 15 s.
+        assert_eq!(manager.devices[0].last_success, Some(100));
+        assert_eq!(
+            manager.devices[0]
+                .reading
+                .as_ref()
+                .unwrap()
+                .normalized_percent(),
+            shown
+        );
+        manager.apply_link("mouse", Err(DeviceError::Protocol("bad".into())), 300);
+        assert!(!manager.devices[0].connected);
+        assert_eq!(manager.devices[0].last_success, Some(100));
+    }
+    #[test]
+    fn cancelled_reads_are_not_link_evidence() {
+        let mut manager = Manager::default();
+        manager.merge(vec![candidate("mouse", DeviceKind::Mouse, true)], 100);
+        manager.apply("mouse", Err(DeviceError::Cancelled), 200);
+        assert!(manager.devices[0].connected);
+        assert_eq!(manager.devices[0].silent_since, None);
     }
     #[test]
     fn link_transitions_need_a_confirmed_previous_state() {
