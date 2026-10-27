@@ -72,7 +72,7 @@
 
 以下四个项目分别覆盖了"多策略降级""协议描述表""能力声明""事务可靠性"，值得分别借鉴。
 
-### 多策略降级链（`2.4G-battery-viewer`，纯 ctypes）
+### 多策略降级链（纯 ctypes 实现）
 
 `read_battery()` 按固定顺序尝试，第一个成功即返回：
 
@@ -180,7 +180,6 @@
 
 ## 参考资料
 
-- [2.4G-battery-viewer](https://github.com/yszyszysz233/2.4G-battery-viewer) — 纯 ctypes 实现，多策略降级与协议描述表的完整样本，含踩坑清单
 - [razer-blackshark-v2-hyperspeed-webhid](https://github.com/justik13/razer-blackshark-v2-hyperspeed-webhid) — 序号关联、接口隔离与校验的完整协议文档
 - [HeadsetControl](https://github.com/Sapd/HeadsetControl) — 设备注册表、能力位掩码与协议模板的组织方式
 - [Arctis Nova 7X HID tools](https://onlybits.org/cheahkhing/arctis-headset-hid) — USBPcap 抓包流程与轮询架构
